@@ -59,7 +59,7 @@ Provider 适配器，所以 T3 出新版时很容易继续套用。
 ## 安装
 
 ```powershell
-git clone https://github.com/alllyx520-bot/t3code-claude-quota.git
+git clone https://github.com/Allyx890/t3code-claude-quota.git
 cd t3code-claude-quota
 .\Update-T3-Quota.ps1
 ```

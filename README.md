@@ -68,7 +68,7 @@ Tested with T3 Code **v0.1.2**. Other versions must pass the patch, test and bui
 ## Install
 
 ```powershell
-git clone https://github.com/alllyx520-bot/t3code-claude-quota.git
+git clone https://github.com/Allyx890/t3code-claude-quota.git
 cd t3code-claude-quota
 .\Update-T3-Quota.ps1
 ```
