@@ -1,0 +1,1964 @@
+diff --git a/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts b/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts
+new file mode 100644
+index 00000000..f425e27b
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts
+@@ -0,0 +1,641 @@
++import {
++  ProviderInstanceId,
++  RunId,
++  RuntimeRequestId,
++  ThreadId,
++  type OrchestrationV2ThreadShell,
++  type ServerProvider,
++} from "@t3tools/contracts";
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { assert, it as effectIt } from "@effect/vitest";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++import { describe, expect, it } from "vite-plus/test";
++
++import * as ServerConfig from "../config.ts";
++import * as SqlitePersistence from "../persistence/Sqlite.ts";
++import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
++import * as ProjectService from "../project/ProjectService.ts";
++import * as ServerSettings from "../serverSettings.ts";
++import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
++import {
++  activationSelection,
++  AutopilotConfig,
++  applyKnownResets,
++  ensureActivationProject,
++  finishedActivationThreads,
++  isActivationConfirmed,
++  isActivationDue,
++  applyLimitHits,
++  isAccountFull,
++  MAX_CONTINUES_PER_WINDOW,
++  pickTargetAccount,
++  planThreadSwitch,
++  readAccountQuota,
++  weeklyRemainingFor,
++  type AccountQuota,
++} from "./ClaudeQuotaAutopilot.ts";
++import * as RuntimeLayer from "./runtimeLayer.ts";
++
++const nowMs = Date.parse("2026-10-23T17:00:00.000Z");
++const config = Schema.decodeUnknownSync(AutopilotConfig)({
++  enabled: true,
++  accounts: ["a", "b", "c"],
++});
++
++const account = (id: string, sessionRemaining: number | null, extra: Partial<AccountQuota> = {}) =>
++  ({
++    id: ProviderInstanceId.make(id),
++    ready: true,
++    sessionRemaining,
++    sessionResetsAtMs: null,
++    weeklyRemaining: 50,
++    models: ["claude-opus-5-5", "claude-haiku-4-5"],
++    checkedAtMs: nowMs,
++    ...extra,
++  }) satisfies AccountQuota;
++
++// Only the fields the planner reads; the real shape is exercised in runtimeLayer.test.ts.
++const thread = (extra: Partial<OrchestrationV2ThreadShell> = {}) =>
++  ({
++    id: ThreadId.make("thread-1"),
++    title: "Work",
++    modelSelection: { instanceId: ProviderInstanceId.make("a"), model: "claude-opus-5-5" },
++    status: "completed",
++    activeRunId: null,
++    latestRunId: RunId.make("run-1"),
++    lastErrorClass: null,
++    pendingRuntimeRequest: null,
++    archivedAt: null,
++    settledOverride: null,
++    lineage: {
++      parentThreadId: null,
++      relationshipToParent: null,
++      rootThreadId: ThreadId.make("thread-1"),
++    },
++    creationSource: "web",
++    updatedAt: DateTime.makeUnsafe(nowMs - 60_000),
++    ...extra,
++  }) as OrchestrationV2ThreadShell;
++
++// Provider snapshots carry ~35 fields; these fixtures only fill what readAccountQuota reads.
++describe("readAccountQuota", () => {
++  it("reads the 5-hour window, the weekly windows and the models", () => {
++    const quota = readAccountQuota({
++      instanceId: ProviderInstanceId.make("claudeAgent"),
++      enabled: true,
++      status: "ready",
++      models: [{ slug: "claude-opus-5-5" }],
++      usageLimits: {
++        checkedAt: "2026-10-23T17:00:20.208Z",
++        windows: [
++          { id: "five_hour", kind: "session", label: "Session", usedPercent: 0 },
++          {
++            id: "seven_day",
++            kind: "weekly",
++            label: "Weekly",
++            usedPercent: 50,
++            resetsAt: "2026-10-26T06:59:59.645Z",
++          },
++          { id: "seven_day_sonnet", kind: "weekly", label: "Weekly · Sonnet", usedPercent: 97 },
++        ],
++      },
++    } as unknown as ServerProvider);
++    expect(quota).toEqual({
++      id: "claudeAgent",
++      ready: true,
++      sessionRemaining: 100,
++      sessionResetsAtMs: null,
++      weeklyRemaining: 50,
++      modelWeekly: [{ model: "sonnet", remaining: 3 }],
++      models: ["claude-opus-5-5"],
++      checkedAtMs: Date.parse("2026-10-23T17:00:20.208Z"),
++    });
++  });
++
++  it("treats a failed probe as unknown quota", () => {
++    const quota = readAccountQuota({
++      instanceId: ProviderInstanceId.make("b"),
++      enabled: true,
++      status: "ready",
++      models: [],
++      usageLimits: {
++        checkedAt: "2026-10-23T17:00:00.000Z",
++        windows: [{ id: "five_hour", kind: "session", label: "Session", usedPercent: 10 }],
++        unavailable: { reason: "probeFailed" },
++      },
++    } as unknown as ServerProvider);
++    expect(quota.sessionRemaining).toBeNull();
++  });
++});
++
++describe("pickTargetAccount", () => {
++  it("picks the most quota left and skips unusable accounts", () => {
++    const accounts = [
++      account("a", 2),
++      account("b", 40),
++      account("c", 90, { weeklyRemaining: 5 }),
++      account("d", 95, { checkedAtMs: nowMs - 60 * 60_000 }),
++      account("e", 99, { ready: false }),
++      account("g", 98, { models: ["claude-haiku-4-5"] }),
++      account("f", 70),
++    ];
++    expect(
++      pickTargetAccount(accounts, ProviderInstanceId.make("a"), "claude-opus-5-5", config, nowMs)
++        ?.id,
++    ).toBe("f");
++  });
++
++  it("finds nothing when every other account is at or below the threshold", () => {
++    expect(
++      pickTargetAccount(
++        [account("a", 1), account("b", 5)],
++        ProviderInstanceId.make("a"),
++        "claude-opus-5-5",
++        config,
++        nowMs,
++      ),
++    ).toBeNull();
++  });
++});
++
++describe("applyLimitHits", () => {
++  it("empties an account a run hit the limit on until a later probe", () => {
++    const hits = new Map([["a", nowMs - 60_000]]);
++    const [stale, fresh] = applyLimitHits(
++      [account("a", 70, { checkedAtMs: nowMs - 120_000 }), account("b", 70)],
++      hits,
++    );
++    expect(stale?.sessionRemaining).toBe(0);
++    expect(fresh?.sessionRemaining).toBe(70);
++    expect(applyLimitHits([account("a", 70)], hits)[0]?.sessionRemaining).toBe(70);
++  });
++});
++
++describe("planThreadSwitch", () => {
++  const accounts = [account("a", 3), account("b", 60)];
++
++  it("resumes a usage-limited run on the best account", () => {
++    const plan = planThreadSwitch(
++      thread({ status: "failed", lastErrorClass: "usage_limit" }),
++      [account("a", 50), account("b", 60)],
++      config,
++      nowMs,
++    );
++    expect(plan).toMatchObject({
++      kind: "continue",
++      command: {
++        type: "message.dispatch",
++        manualContinuationOfRunId: "run-1",
++        modelSelection: { instanceId: "b", model: "claude-opus-5-5" },
++        text: "Continue where you left off.",
++      },
++    });
++  });
++
++  it("moves an idle conversation off an account whose weekly quota is nearly spent", () => {
++    const plan = planThreadSwitch(
++      thread(),
++      [account("a", 100, { weeklyRemaining: 4 }), account("b", 60)],
++      config,
++      nowMs,
++    );
++    expect(plan?.kind).toBe("switch");
++  });
++
++  it("reports when a conversation needs a move but no account can take it", () => {
++    expect(planThreadSwitch(thread(), [account("a", 3), account("b", 4)], config, nowMs)).toEqual({
++      kind: "no_target",
++    });
++    expect(
++      planThreadSwitch(
++        thread({ status: "failed", lastErrorClass: "usage_limit" }),
++        [account("a", 0), account("b", 60, { models: ["claude-haiku-4-5"] })],
++        config,
++        nowMs,
++      ),
++    ).toEqual({ kind: "no_target" });
++  });
++
++  it("does not resume a run the limit stopped more than one window ago", () => {
++    const limited = thread({
++      status: "failed",
++      lastErrorClass: "usage_limit",
++      latestRunCompletedAt: DateTime.makeUnsafe(nowMs - 6 * 60 * 60_000),
++    });
++    expect(
++      planThreadSwitch(limited, [account("a", 50), account("b", 60)], config, nowMs),
++    ).toBeNull();
++  });
++
++  it.each([
++    ["recent", 0],
++    ["days-old", 3 * 24 * 60 * 60_000],
++  ])("moves a %s idle conversation off an account at the threshold", (_age, idleMs) => {
++    const plan = planThreadSwitch(
++      thread({ updatedAt: DateTime.makeUnsafe(nowMs - idleMs) }),
++      accounts,
++      config,
++      nowMs,
++    );
++    expect(plan).toMatchObject({
++      kind: "switch",
++      command: {
++        type: "thread.model-selection.set",
++        modelSelection: { instanceId: "b", model: "claude-opus-5-5" },
++      },
++    });
++  });
++
++  it("keeps an idle conversation with live background tasks on its account until the limit stops it", () => {
++    const monitored = {
++      pendingBackgroundTasks: [
++        { taskId: "task-1", kind: "monitor" as const, description: "PPO5 GPU3 health" },
++        {
++          taskId: "pull-request-watch:github:o/r#1",
++          kind: "monitor" as const,
++          description: "Watching pull request #1",
++        },
++      ],
++    };
++    expect(planThreadSwitch(thread(monitored), accounts, config, nowMs)).toEqual({
++      kind: "held",
++      backgroundTasks: 1,
++    });
++    const plan = planThreadSwitch(
++      thread({ ...monitored, status: "failed", lastErrorClass: "usage_limit" }),
++      [account("a", 0), account("b", 60)],
++      config,
++      nowMs,
++    );
++    expect(plan).toMatchObject({
++      kind: "continue",
++      command: {
++        type: "message.dispatch",
++        text: expect.stringMatching(/^Continue where you left off\. .*\(PPO5 GPU3 health\)/),
++      },
++    });
++  });
++
++  it("moves a conversation whose idle compaction hit the limit without asking it to continue", () => {
++    const compacted = { status: "failed" as const, lastErrorClass: "usage_limit" as const };
++    const history = { limitedRunAccount: "a", limitedRunWasIdleCompaction: true };
++    const plan = planThreadSwitch(
++      thread(compacted),
++      [account("a", 40), account("b", 60)],
++      config,
++      nowMs,
++      history,
++    );
++    expect(plan).toMatchObject({ kind: "switch", command: { type: "thread.model-selection.set" } });
++    expect(
++      planThreadSwitch(
++        thread({
++          ...compacted,
++          pendingBackgroundTasks: [{ taskId: "task-1", kind: "monitor" }],
++        }),
++        [account("a", 40), account("b", 60)],
++        config,
++        nowMs,
++        history,
++      ),
++    ).toEqual({ kind: "held", backgroundTasks: 1 });
++  });
++
++  it("leaves a conversation alone once it has moved off the account its run was limited on", () => {
++    const moved = thread({
++      status: "failed",
++      lastErrorClass: "usage_limit",
++      modelSelection: { instanceId: ProviderInstanceId.make("b"), model: "claude-opus-5-5" },
++    });
++    expect(
++      planThreadSwitch(moved, [account("a", 0), account("b", 60)], config, nowMs, {
++        limitedRunAccount: "a",
++        limitedRunWasIdleCompaction: true,
++      }),
++    ).toBeNull();
++  });
++
++  it("stops continuing a conversation that keeps hitting limits", () => {
++    expect(
++      planThreadSwitch(
++        thread({ status: "failed", lastErrorClass: "usage_limit" }),
++        [account("a", 0), account("b", 60)],
++        config,
++        nowMs,
++        { limitedRunAccount: "a", recentContinues: MAX_CONTINUES_PER_WINDOW },
++      ),
++    ).toEqual({ kind: "gave_up", continues: MAX_CONTINUES_PER_WINDOW });
++  });
++
++  it("still moves an idle conversation whose only background work is a pull request watch", () => {
++    const watched = thread({
++      pendingBackgroundTasks: [
++        {
++          taskId: "pull-request-watch:github:o/r#1",
++          kind: "monitor",
++          description: "Watching pull request #1",
++        },
++      ],
++    });
++    expect(planThreadSwitch(watched, accounts, config, nowMs)?.kind).toBe("switch");
++  });
++
++  it("leaves running, waiting, archived and healthy conversations alone", () => {
++    for (const candidate of [
++      thread({ status: "running" }),
++      thread({ activeRunId: RunId.make("run-2") }),
++      thread({
++        pendingRuntimeRequest: {
++          id: RuntimeRequestId.make("request-1"),
++          kind: "permission",
++          createdAt: DateTime.makeUnsafe(nowMs),
++        },
++      }),
++      thread({ archivedAt: DateTime.makeUnsafe(nowMs) }),
++      thread({ settledOverride: "settled" }),
++      thread({
++        lineage: {
++          parentThreadId: ThreadId.make("parent"),
++          relationshipToParent: "subagent",
++          rootThreadId: ThreadId.make("parent"),
++        },
++        creationSource: "provider",
++      }),
++      thread({ id: ThreadId.make("claude-quota-hi-a-1") }),
++      thread({ modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" } }),
++    ])
++      expect(planThreadSwitch(candidate, accounts, config, nowMs)).toBeNull();
++    expect(
++      planThreadSwitch(thread(), [account("a", 30), account("b", 60)], config, nowMs),
++    ).toBeNull();
++  });
++});
++
++describe("model weekly windows", () => {
++  const sonnetLow = account("a", 50, { modelWeekly: [{ model: "sonnet", remaining: 3 }] });
++  const sonnet = { instanceId: ProviderInstanceId.make("a"), model: "claude-sonnet-5-5" };
++
++  it("count only for the model they belong to", () => {
++    expect(weeklyRemainingFor(sonnetLow, "claude-sonnet-5-5")).toBe(3);
++    expect(weeklyRemainingFor(sonnetLow, "claude-opus-5-5")).toBe(50);
++    expect(weeklyRemainingFor(sonnetLow)).toBe(50);
++  });
++
++  it("move a conversation on that model and leave the others", () => {
++    const pool = [sonnetLow, account("b", 60, { models: ["claude-sonnet-5-5"] })];
++    expect(planThreadSwitch(thread({ modelSelection: sonnet }), pool, config, nowMs)).toMatchObject(
++      { kind: "switch", target: { id: "b" } },
++    );
++    expect(planThreadSwitch(thread(), pool, config, nowMs)).toBeNull();
++  });
++
++  it("keep an account out of the targets for that model only", () => {
++    const pool = [
++      account("c", 3),
++      { ...sonnetLow, models: ["claude-sonnet-5-5", "claude-opus-5-5"] },
++    ];
++    expect(
++      pickTargetAccount(pool, ProviderInstanceId.make("c"), "claude-sonnet-5-5", config, nowMs),
++    ).toBeNull();
++    expect(
++      pickTargetAccount(pool, ProviderInstanceId.make("c"), "claude-opus-5-5", config, nowMs)?.id,
++    ).toBe("a");
++  });
++});
++
++describe("applyKnownResets", () => {
++  it("treats an account as full once its reported window has ended, until a newer probe", () => {
++    const resets = new Map([["a", nowMs - 40_000]]);
++    const spent = account("a", 0, { checkedAtMs: nowMs - 4 * 60_000 });
++    expect(applyKnownResets([spent], resets, nowMs)[0]).toMatchObject({
++      sessionRemaining: 100,
++      sessionResetsAtMs: null,
++      checkedAtMs: nowMs - 40_000,
++    });
++    // Too close to the reported reset, or already probed after it.
++    expect(applyKnownResets([spent], new Map([["a", nowMs - 10_000]]), nowMs)[0]).toBe(spent);
++    const probedAfter = { ...spent, checkedAtMs: nowMs - 5_000 };
++    expect(applyKnownResets([probedAfter], resets, nowMs)[0]).toBe(probedAfter);
++  });
++
++  it("still lets a limit hit after the reset empty the account", () => {
++    const reset = applyKnownResets(
++      [account("a", 0, { checkedAtMs: nowMs - 4 * 60_000 })],
++      new Map([["a", nowMs - 40_000]]),
++      nowMs,
++    );
++    expect(applyLimitHits(reset, new Map([["a", nowMs - 1_000]]))[0]?.sessionRemaining).toBe(0);
++  });
++});
++
++describe("activation", () => {
++  it("deletes an activation thread once its run is over, and only then", () => {
++    const hi = (extra: Partial<OrchestrationV2ThreadShell>) =>
++      thread({
++        id: ThreadId.make(`claude-quota-hi-a-${Object.keys(extra).join("-")}`),
++        createdAt: DateTime.makeUnsafe(nowMs - 60_000),
++        latestRunCompletedAt: null,
++        ...extra,
++      });
++    const done = hi({ latestRunCompletedAt: DateTime.makeUnsafe(nowMs - 5_000) });
++    const abandoned = hi({ createdAt: DateTime.makeUnsafe(nowMs - 31 * 60_000) });
++    // Waiting on an approval nobody will give: deleting it cancels the run.
++    const stuck = hi({
++      status: "waiting",
++      activeRunId: RunId.make("run-3"),
++      createdAt: DateTime.makeUnsafe(nowMs - 45 * 60_000),
++    });
++    expect(
++      finishedActivationThreads(
++        [
++          done,
++          abandoned,
++          hi({ status: "running", activeRunId: RunId.make("run-2") }),
++          stuck,
++          hi({ status: "starting" }),
++          // A fresh launch whose run has not been recorded yet.
++          hi({ latestRunId: null }),
++          thread({ latestRunCompletedAt: DateTime.makeUnsafe(nowMs - 5_000) }),
++        ],
++        nowMs,
++      ),
++    ).toEqual([done, abandoned, stuck]);
++  });
++
++  const full = account("b", 100);
++  const due = (overrides: Partial<Parameters<typeof isActivationDue>[0]> = {}) =>
++    isActivationDue({
++      account: full,
++      fullSinceMs: nowMs - 10 * 60_000,
++      lastAttemptMs: undefined,
++      busy: false,
++      config,
++      nowMs,
++      ...overrides,
++    });
++
++  it("is due once fresh probes have shown a full idle account for the configured time", () => {
++    expect(due()).toBe(true);
++    expect(due({ fullSinceMs: nowMs - 9 * 60_000 })).toBe(false);
++    expect(due({ fullSinceMs: undefined })).toBe(false);
++    expect(due({ busy: true })).toBe(false);
++    expect(due({ lastAttemptMs: nowMs - 10 * 60_000 })).toBe(false);
++    expect(due({ lastAttemptMs: nowMs - 31 * 60_000 })).toBe(true);
++  });
++
++  it("is due right after a known window ends, before any probe shows the account full", () => {
++    const resetAtMs = nowMs - 40_000;
++    // The last probe ran before the reset: 0% left in a window that has since ended.
++    const spent = account("b", 0, {
++      sessionResetsAtMs: resetAtMs,
++      checkedAtMs: nowMs - 4 * 60_000,
++    });
++    const afterReset = (overrides: Partial<Parameters<typeof isActivationDue>[0]> = {}) =>
++      due({ account: spent, fullSinceMs: undefined, lastResetAtMs: resetAtMs, ...overrides });
++    expect(afterReset()).toBe(true);
++    expect(afterReset({ lastAttemptMs: nowMs - 6 * 60 * 60_000 })).toBe(true);
++    // Too close to the reported reset, already sent for this window, in use, or out of weekly quota.
++    expect(afterReset({ lastResetAtMs: nowMs - 20_000 })).toBe(false);
++    expect(afterReset({ lastAttemptMs: nowMs - 10_000 })).toBe(false);
++    expect(afterReset({ busy: true })).toBe(false);
++    expect(afterReset({ account: { ...spent, weeklyRemaining: 3 } })).toBe(false);
++    expect(afterReset({ account: { ...spent, ready: false } })).toBe(false);
++    expect(afterReset({ lastResetAtMs: undefined })).toBe(false);
++  });
++
++  it("confirms an activation only from a window that started after it", () => {
++    const sentAtMs = nowMs - 20_000;
++    const ended = account("b", 0, { sessionResetsAtMs: nowMs - 60_000 });
++    const started = account("b", 99, { sessionResetsAtMs: sentAtMs + 5 * 60 * 60_000 });
++    expect(isActivationConfirmed(ended, sentAtMs)).toBe(false);
++    expect(isActivationConfirmed(account("b", 100), sentAtMs)).toBe(false);
++    expect(isActivationConfirmed(started, undefined)).toBe(false);
++    expect(isActivationConfirmed(started, sentAtMs)).toBe(true);
++  });
++
++  it("does not count an account whose window is already running or whose week is nearly spent", () => {
++    const full = (extra: Partial<AccountQuota>, remaining = 100) =>
++      isAccountFull(account("b", remaining, extra), config, nowMs);
++    expect(full({ sessionResetsAtMs: nowMs + 60_000 })).toBe(false);
++    expect(full({ weeklyRemaining: 5 })).toBe(false);
++    expect(full({}, 99)).toBe(false);
++    expect(full({ checkedAtMs: nowMs - 60 * 60_000 })).toBe(false);
++    expect(full({ sessionResetsAtMs: nowMs - 1 })).toBe(true);
++  });
++});
++
++describe("activationSelection", () => {
++  const effort = (...levels: string[]) => ({
++    optionDescriptors: [
++      {
++        id: "effort",
++        label: "Effort",
++        type: "select" as const,
++        options: levels.map((id) => ({ id, label: id })),
++      },
++    ],
++  });
++  const provider = (models: ReadonlyArray<object>) =>
++    ({ instanceId: ProviderInstanceId.make("Claude4"), models }) as unknown as ServerProvider;
++
++  it("uses the configured model at the configured effort", () => {
++    expect(
++      activationSelection(
++        provider([
++          { slug: "claude-opus-5-5", isDefault: true, capabilities: effort("low", "high") },
++          { slug: "claude-haiku-5-5", capabilities: effort("low", "medium") },
++        ]),
++        config,
++      ),
++    ).toEqual({
++      instanceId: "Claude4",
++      model: "claude-haiku-5-5",
++      options: [{ id: "effort", value: "low" }],
++    });
++  });
++
++  it("leaves the effort unset when the model does not offer that level", () => {
++    expect(
++      activationSelection(
++        provider([{ slug: "claude-haiku-5-5", capabilities: effort("medium", "high") }]),
++        config,
++      ),
++    ).toEqual({ instanceId: "Claude4", model: "claude-haiku-5-5" });
++  });
++
++  it("falls back to the account's default model", () => {
++    expect(
++      activationSelection(
++        provider([
++          { slug: "claude-sonnet-5-5", capabilities: null },
++          { slug: "claude-opus-5-5", isDefault: true, capabilities: null },
++        ]),
++        config,
++      ),
++    ).toEqual({ instanceId: "Claude4", model: "claude-opus-5-5" });
++    expect(activationSelection(provider([]), config)).toBeNull();
++  });
++});
++
++// The real project service and workspace checks, so the folder handling matches T3's.
++const layerRealProjects = (baseDir: string) =>
++  RuntimeLayer.layerProjectService.pipe(
++    Layer.provideMerge(
++      Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({
++        peek: () =>
++          Effect.succeed({
++            repositoryIdentity: null,
++            faviconPath: null,
++            repositoryIdentityResolved: false,
++          }),
++        getAvailable: () =>
++          Effect.succeed({
++            repositoryIdentity: null,
++            faviconPath: null,
++            repositoryIdentityResolved: false,
++          }),
++        invalidate: () => Effect.void,
++      }),
++    ),
++    Layer.provideMerge(WorkspacePaths.layer),
++    Layer.provideMerge(SqlitePersistence.layerMemory),
++    Layer.provideMerge(ServerSettings.layerTest()),
++    Layer.provideMerge(ServerConfig.layerTest(baseDir, baseDir)),
++    Layer.provideMerge(NodeServices.layer),
++  );
++
++describe("ensureActivationProject", () => {
++  effectIt.effect("creates the missing timer folder and project, then reuses them", () =>
++    Effect.gen(function* () {
++      const fileSystem = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const baseDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-quota-activation-" });
++      const root = path.join(baseDir, "claude-quota-activation");
++      yield* Effect.gen(function* () {
++        const projects = yield* ProjectService.ProjectService;
++        const modelSelection = {
++          instanceId: ProviderInstanceId.make("Claude3"),
++          model: "claude-haiku-4-5",
++        };
++        const first = yield* ensureActivationProject(fileSystem, projects, {
++          root,
++          modelSelection,
++          attempt: "a",
++        });
++        assert.equal(first.workspaceRoot, path.resolve(root));
++        assert.isTrue(yield* fileSystem.exists(root));
++        const second = yield* ensureActivationProject(fileSystem, projects, {
++          root,
++          modelSelection,
++          attempt: "b",
++        });
++        assert.equal(second.id, first.id);
++      }).pipe(Effect.provide(layerRealProjects(baseDir)));
++    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
++  );
++});
+diff --git a/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.ts b/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.ts
+new file mode 100644
+index 00000000..714a402a
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.ts
+@@ -0,0 +1,978 @@
++/**
++ * Claude quota autopilot for users with several Claude subscriptions.
++ *
++ * - A conversation whose account is nearly out of its 5-hour or weekly quota moves to the
++ *   pooled account with the most quota left for its model. A run the limit already stopped
++ *   is resumed there within seconds, exactly like the composer's Resume button with another
++ *   account selected.
++ * - An idle account whose 5-hour window has ended gets a one-word message on a fresh thread,
++ *   so its next window starts counting down while nobody needs it. The thread is deleted
++ *   once the reply is in.
++ *
++ * Opt-in through `<stateDir>/claude-quota.json`; without that file nothing runs. Decisions
++ * are logged to `<logsDir>/claude-quota.ndjson`. Only existing commands, the event stream
++ * and the provider registry's usage probe are used, so this file is the whole feature.
++ */
++import {
++  CommandId,
++  isProviderNativeSubagentThread,
++  MessageId,
++  ProjectId,
++  ThreadId,
++  type ModelSelection,
++  type OrchestrationV2Command,
++  type OrchestrationV2DomainEvent,
++  type OrchestrationV2ThreadShell,
++  type ProviderInstanceId,
++  type ServerProvider,
++} from "@t3tools/contracts";
++import * as Cause from "effect/Cause";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Option from "effect/Option";
++import * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++import * as Stream from "effect/Stream";
++import * as ServerConfig from "../config.ts";
++import * as Projects from "../project/ProjectService.ts";
++import * as Registry from "../provider/ProviderRegistry.ts";
++import * as Scheduler from "../scheduling/Scheduler.ts";
++import { forkParked } from "../serverActivation.ts";
++import * as ProjectionStore from "./ProjectionStore.ts";
++import * as ThreadLaunch from "./ThreadLaunchService.ts";
++import * as ThreadManagement from "./ThreadManagementService.ts";
++
++export const AutopilotConfig = Schema.Struct({
++  enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
++  /** Log decisions without switching or sending anything. */
++  observeOnly: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
++  /**
++   * Provider instance ids that belong to the pool, e.g. ["claudeAgent", "Claude3"].
++   * Empty means every Claude instance.
++   */
++  accounts: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
++  switchAtRemainingPercent: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(5))),
++  /** Send the "hi" that starts an idle account's 5-hour window. */
++  activate: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
++  activateAfterFullMinutes: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(10))),
++  /** Falls back to the account's default model when the account does not offer it. */
++  activationModel: Schema.String.pipe(
++    Schema.withDecodingDefault(Effect.succeed("claude-haiku-5-5")),
++  ),
++  /** Applied only when the chosen model offers this effort level. */
++  activationEffort: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("low"))),
++});
++export type AutopilotConfig = typeof AutopilotConfig.Type;
++const decodeConfig = Schema.decodeUnknownEffect(Schema.fromJsonString(AutopilotConfig));
++const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
++const isoOrNull = (ms: number | null) =>
++  ms === null || !Number.isFinite(ms) ? null : DateTime.formatIso(DateTime.makeUnsafe(ms));
++
++// Failed runs and known resets wake a sweep early, so this only paces idle moves.
++const SWEEP_EVERY_MS = 60_000;
++// The failed run's error item can land just after the run update that wakes the sweep.
++const FAILURE_SETTLE_MS = 2_000;
++// Just over the Claude driver's 5 minute usage cache, so each probe is fresh.
++const PROBE_EVERY_MS = 330_000;
++const FRESH_MS = 15 * 60_000;
++const ACTIVATION_RETRY_MS = 30 * 60_000;
++// Reported reset times agree to within a second; the margin keeps a "hi" out of the old window.
++const RESET_MARGIN_MS = 30_000;
++// One 5-hour window: older limited runs were abandoned or already resumed by the reset worker,
++// and continuing them unasked would restart forgotten work.
++const CONTINUE_WITHIN_MS = 5 * 60 * 60_000;
++const HEARTBEAT_MS = 30 * 60_000;
++const LOG_ROTATE_BYTES = 2 * 1024 * 1024;
++const CONTINUE_TEXT = "Continue where you left off.";
++const ACTIVATION_TEXT = "Only reply with 'Hi'.";
++// A launch that never produced a finished run is given up on after this long.
++const ACTIVATION_THREAD_TTL_MS = 30 * 60_000;
++const ACTIVATION_THREAD_PREFIX = "claude-quota-hi-";
++const CLAUDE_DRIVER = "claudeAgent";
++const describe = (cause: Cause.Cause<unknown>) => {
++  const error = Cause.squash(cause);
++  return error instanceof Error ? error.message : String(error);
++};
++const RUNNING = new Set(["preparing", "queued", "starting", "running", "waiting"]);
++
++export interface AccountQuota {
++  readonly id: ProviderInstanceId;
++  readonly ready: boolean;
++  /** 5-hour quota left, 0–100; null when the account has not reported it. */
++  readonly sessionRemaining: number | null;
++  readonly sessionResetsAtMs: number | null;
++  /** Least weekly quota left across the account-wide weekly windows, 0–100; null when none is reported. */
++  readonly weeklyRemaining: number | null;
++  /** Weekly windows that only count one model, keyed by a slug fragment such as "opus". */
++  readonly modelWeekly?: ReadonlyArray<{ readonly model: string; readonly remaining: number }>;
++  readonly models: ReadonlyArray<string>;
++  readonly checkedAtMs: number;
++}
++
++export function readAccountQuota(provider: ServerProvider): AccountQuota {
++  const limits = provider.usageLimits;
++  const windows = limits?.unavailable ? [] : (limits?.windows ?? []);
++  const session = windows.find((window) => window.id === "five_hour");
++  const resetsAtMs = session?.resetsAt ? Date.parse(session.resetsAt) : Number.NaN;
++  // Claude names a model's own weekly window `seven_day_<display name>`.
++  const scoped = (window: (typeof windows)[number]) =>
++    window.kind === "weekly" && window.id.startsWith("seven_day_");
++  const weekly = windows.filter((window) => window.kind === "weekly" && !scoped(window));
++  return {
++    id: provider.instanceId,
++    ready: provider.enabled && provider.status === "ready",
++    sessionRemaining: session ? 100 - session.usedPercent : null,
++    sessionResetsAtMs: Number.isFinite(resetsAtMs) ? resetsAtMs : null,
++    weeklyRemaining:
++      weekly.length === 0 ? null : Math.min(...weekly.map((window) => 100 - window.usedPercent)),
++    modelWeekly: windows.filter(scoped).map((window) => ({
++      model: window.id.slice("seven_day_".length).replace(/_+/g, "-").replace(/^-|-$/g, ""),
++      remaining: 100 - window.usedPercent,
++    })),
++    models: provider.models.map((model) => model.slug),
++    checkedAtMs: limits ? Date.parse(limits.checkedAt) : Number.NaN,
++  };
++}
++
++const isFresh = (account: AccountQuota, nowMs: number) => nowMs - account.checkedAtMs <= FRESH_MS;
++/** Weekly quota left for `model`: the account-wide windows plus any window of that model's own. */
++export function weeklyRemainingFor(account: AccountQuota, model?: string): number | null {
++  let remaining = account.weeklyRemaining;
++  for (const window of account.modelWeekly ?? []) {
++    if (model === undefined || !model.includes(window.model)) continue;
++    remaining = remaining === null ? window.remaining : Math.min(remaining, window.remaining);
++  }
++  return remaining;
++}
++const isWeekLow = (account: AccountQuota, config: AutopilotConfig, model?: string) => {
++  const remaining = weeklyRemainingFor(account, model);
++  return remaining !== null && remaining <= config.switchAtRemainingPercent;
++};
++
++/** The pooled account offering `model` with the most 5-hour quota left, both windows above the threshold. */
++export function pickTargetAccount(
++  accounts: ReadonlyArray<AccountQuota>,
++  sourceId: ProviderInstanceId,
++  model: string,
++  config: AutopilotConfig,
++  nowMs: number,
++): AccountQuota | null {
++  let best: AccountQuota | null = null;
++  for (const account of accounts) {
++    if (
++      account.id === sourceId ||
++      !account.ready ||
++      !isFresh(account, nowMs) ||
++      !account.models.includes(model) ||
++      isWeekLow(account, config, model) ||
++      account.sessionRemaining === null ||
++      account.sessionRemaining <= config.switchAtRemainingPercent
++    )
++      continue;
++    if (best === null || account.sessionRemaining > (best.sessionRemaining ?? 0)) best = account;
++  }
++  return best;
++}
++
++/**
++ * Moving a thread to another account closes its provider session, killing these. T3's own
++ * pull request watches are not part of the session and survive.
++ */
++const backgroundTasksOf = (thread: OrchestrationV2ThreadShell) =>
++  (thread.pendingBackgroundTasks ?? []).filter(
++    (task) => !task.taskId.startsWith("pull-request-watch:"),
++  );
++
++function continueText(thread: OrchestrationV2ThreadShell): string {
++  const tasks = backgroundTasksOf(thread);
++  if (tasks.length === 0) return CONTINUE_TEXT;
++  const list = tasks.map((task) => task.description ?? `${task.kind} ${task.taskId}`).join("; ");
++  return `${CONTINUE_TEXT} The previous account ran out of quota, and switching accounts stopped this thread's background tasks (${list}). Check their state and restart the ones that are still needed.`;
++}
++
++/** What the sweep knows about a thread beyond its shell. */
++export interface ThreadHistory {
++  /**
++   * The account the limited run used. A thread already moved off it keeps the failed status,
++   * which must not move it again.
++   */
++  readonly limitedRunAccount?: string;
++  /** The limited run was T3's idle `/compact`, so there is no work to continue. */
++  readonly limitedRunWasIdleCompaction?: boolean;
++  /** Automatic continues already sent within the last window. */
++  readonly recentContinues?: number;
++}
++
++/** Each continue that fails again costs a handoff; past this the reset auto-resume takes over. */
++export const MAX_CONTINUES_PER_WINDOW = 3;
++
++/** Usage limit runs whose failure tells more than the account's probe. */
++export function limitFailureAtMs(thread: OrchestrationV2ThreadShell): number | null {
++  return thread.status === "failed" &&
++    thread.lastErrorClass === "usage_limit" &&
++    thread.latestRunId !== null
++    ? DateTime.toEpochMillis(thread.latestRunCompletedAt ?? thread.updatedAt)
++    : null;
++}
++
++/** An account a run just hit the limit on counts as empty until a later probe says otherwise. */
++export function applyLimitHits(
++  accounts: ReadonlyArray<AccountQuota>,
++  limitHitAtMs: ReadonlyMap<string, number>,
++): ReadonlyArray<AccountQuota> {
++  return accounts.map((account) =>
++    (limitHitAtMs.get(account.id) ?? Number.NEGATIVE_INFINITY) > account.checkedAtMs
++      ? { ...account, sessionRemaining: 0 }
++      : account,
++  );
++}
++
++/**
++ * A window whose reported end has passed is full again, though the next probe may be minutes
++ * away: Claude caches usage for 5 minutes and probes are paced past that.
++ */
++export function applyKnownResets(
++  accounts: ReadonlyArray<AccountQuota>,
++  resetAtMs: ReadonlyMap<string, number>,
++  nowMs: number,
++): ReadonlyArray<AccountQuota> {
++  return accounts.map((account) => {
++    const resetMs = resetAtMs.get(account.id);
++    return resetMs !== undefined &&
++      nowMs >= resetMs + RESET_MARGIN_MS &&
++      account.checkedAtMs < resetMs
++      ? { ...account, sessionRemaining: 100, sessionResetsAtMs: null, checkedAtMs: resetMs }
++      : account;
++  });
++}
++
++export type SwitchPlan =
++  | { readonly kind: "no_target" }
++  /** Low but idle with live background tasks: switching now would kill them, so wait for an actual limit. */
++  | { readonly kind: "held"; readonly backgroundTasks: number }
++  | { readonly kind: "gave_up"; readonly continues: number }
++  | {
++      readonly kind: "continue";
++      readonly target: AccountQuota;
++      readonly command: OrchestrationV2Command;
++    }
++  | {
++      readonly kind: "switch";
++      readonly target: AccountQuota;
++      readonly command: OrchestrationV2Command;
++    };
++
++export function planThreadSwitch(
++  thread: OrchestrationV2ThreadShell,
++  accounts: ReadonlyArray<AccountQuota>,
++  config: AutopilotConfig,
++  nowMs: number,
++  history: ThreadHistory = {},
++): SwitchPlan | null {
++  const sourceId = thread.modelSelection.instanceId;
++  const source = accounts.find((account) => account.id === sourceId);
++  if (
++    !source ||
++    thread.archivedAt !== null ||
++    thread.settledOverride === "settled" ||
++    // The provider owns a native subagent's conversation; its parent is the one to move.
++    isProviderNativeSubagentThread(thread) ||
++    thread.pendingRuntimeRequest !== null ||
++    thread.activeRunId !== null ||
++    RUNNING.has(thread.status) ||
++    thread.id.startsWith(ACTIVATION_THREAD_PREFIX)
++  )
++    return null;
++  const limitedAtMs = limitFailureAtMs(thread);
++  const limited =
++    limitedAtMs !== null &&
++    nowMs - limitedAtMs <= CONTINUE_WITHIN_MS &&
++    (history.limitedRunAccount ?? sourceId) === sourceId;
++  const continuing = limited && history.limitedRunWasIdleCompaction !== true;
++  const low =
++    limited ||
++    (isFresh(source, nowMs) &&
++      (isWeekLow(source, config, thread.modelSelection.model) ||
++        (source.sessionRemaining !== null &&
++          source.sessionRemaining <= config.switchAtRemainingPercent)));
++  // Old idle conversations move too: a message sent to one later would land on the empty account.
++  if (!continuing && !low) return null;
++  if (!continuing && backgroundTasksOf(thread).length > 0)
++    return { kind: "held", backgroundTasks: backgroundTasksOf(thread).length };
++  const continues = history.recentContinues ?? 0;
++  if (continuing && continues >= MAX_CONTINUES_PER_WINDOW) return { kind: "gave_up", continues };
++  const target = pickTargetAccount(accounts, sourceId, thread.modelSelection.model, config, nowMs);
++  // Nothing to move to: the run waits for T3's own reset auto-resume on its account.
++  if (!target) return { kind: "no_target" };
++  const modelSelection: ModelSelection = { ...thread.modelSelection, instanceId: target.id };
++  if (continuing && thread.latestRunId) {
++    const key = `claude-quota:continue:${thread.id}:${thread.latestRunId}`;
++    return {
++      kind: "continue",
++      target,
++      command: {
++        type: "message.dispatch",
++        commandId: CommandId.make(key),
++        messageId: MessageId.make(key),
++        threadId: thread.id,
++        manualContinuationOfRunId: thread.latestRunId,
++        modelSelection,
++        text: continueText(thread),
++        attachments: [],
++        dispatchMode: { type: "start_immediately" },
++        createdBy: "user",
++        creationSource: "server",
++      },
++    };
++  }
++  return {
++    kind: "switch",
++    target,
++    command: {
++      type: "thread.model-selection.set",
++      commandId: CommandId.make(
++        `claude-quota:switch:${thread.id}:${thread.latestRunId ?? "new"}:${target.id}`,
++      ),
++      threadId: thread.id,
++      modelSelection,
++    },
++  };
++}
++
++/**
++ * Each activation gets a fresh thread, deleted once its run is over: the window starts when the
++ * message is processed, so the thread has nothing left to give.
++ */
++export function finishedActivationThreads(
++  shells: ReadonlyArray<OrchestrationV2ThreadShell>,
++  nowMs: number,
++): ReadonlyArray<OrchestrationV2ThreadShell> {
++  return shells.filter(
++    (thread) =>
++      thread.id.startsWith(ACTIVATION_THREAD_PREFIX) &&
++      // Past the TTL even a stuck one goes; deleting a thread cancels its run.
++      (nowMs - DateTime.toEpochMillis(thread.createdAt) >= ACTIVATION_THREAD_TTL_MS ||
++        (thread.activeRunId === null &&
++          !RUNNING.has(thread.status) &&
++          thread.pendingRuntimeRequest === null &&
++          thread.latestRunCompletedAt != null)),
++  );
++}
++
++/** Full means 100% left with no running window, seen on fresh probes spanning the configured time. */
++export function isActivationDue(input: {
++  readonly account: AccountQuota;
++  readonly fullSinceMs: number | undefined;
++  readonly lastAttemptMs: number | undefined;
++  /** End of the latest 5-hour window any probe reported, even if a later probe no longer shows it. */
++  readonly lastResetAtMs?: number | undefined;
++  /** A run is going on the account, or one started since that window ended. */
++  readonly busy: boolean;
++  readonly config: AutopilotConfig;
++  readonly nowMs: number;
++}): boolean {
++  const { account, config, nowMs } = input;
++  if (input.busy) return false;
++  // A known reset needs no fresh probe to confirm it: Claude caches usage for 5 minutes, so
++  // waiting for two full probes would start the next window 5–11 minutes late.
++  const resetAtMs = input.lastResetAtMs;
++  if (
++    resetAtMs !== undefined &&
++    nowMs >= resetAtMs + RESET_MARGIN_MS &&
++    account.ready &&
++    !isWeekLow(account, config) &&
++    (input.lastAttemptMs === undefined || input.lastAttemptMs < resetAtMs)
++  )
++    return true;
++  return (
++    isAccountFull(account, config, nowMs) &&
++    input.fullSinceMs !== undefined &&
++    account.checkedAtMs - input.fullSinceMs >= config.activateAfterFullMinutes * 60_000 &&
++    (input.lastAttemptMs === undefined || nowMs - input.lastAttemptMs >= ACTIVATION_RETRY_MS)
++  );
++}
++
++/**
++ * Only a window ending after the "hi" was sent is its window. Until the next probe the snapshot
++ * still shows the window that just ended, and taking that as confirmation would send another.
++ */
++export function isActivationConfirmed(account: AccountQuota, sentAtMs: number | undefined) {
++  return (
++    sentAtMs !== undefined &&
++    account.sessionResetsAtMs !== null &&
++    account.sessionResetsAtMs > sentAtMs
++  );
++}
++
++export function isAccountFull(
++  account: AccountQuota,
++  config: AutopilotConfig,
++  nowMs: number,
++): boolean {
++  return (
++    account.ready &&
++    isFresh(account, nowMs) &&
++    !isWeekLow(account, config) &&
++    account.sessionRemaining === 100 &&
++    (account.sessionResetsAtMs === null || account.sessionResetsAtMs <= nowMs)
++  );
++}
++
++/** The cheapest selection for the activation "hi" that this account actually offers. */
++export function activationSelection(
++  provider: ServerProvider,
++  config: AutopilotConfig,
++): ModelSelection | null {
++  const model =
++    provider.models.find((candidate) => candidate.slug === config.activationModel) ??
++    provider.models.find((candidate) => candidate.isDefault) ??
++    provider.models[0];
++  if (!model) return null;
++  const effort = model.capabilities?.optionDescriptors?.find(
++    (descriptor) => descriptor.id === "effort" && descriptor.type === "select",
++  );
++  const offersEffort =
++    effort?.type === "select" &&
++    effort.options.some((choice) => choice.id === config.activationEffort);
++  return {
++    instanceId: provider.instanceId,
++    model: model.slug,
++    ...(offersEffort ? { options: [{ id: "effort", value: config.activationEffort }] } : {}),
++  };
++}
++
++export const ensureActivationProject = Effect.fn("ClaudeQuotaAutopilot.ensureActivationProject")(
++  function* (
++    fs: FileSystem.FileSystem,
++    projects: Projects.ProjectService["Service"],
++    input: {
++      readonly root: string;
++      readonly modelSelection: ModelSelection;
++      readonly attempt: string;
++    },
++  ) {
++    // Bootstrap first looks the folder up, which fails while it is missing, so its own
++    // createWorkspaceRootIfMissing is never reached.
++    yield* fs.makeDirectory(input.root, { recursive: true });
++    const { project } = yield* projects.bootstrap({
++      commandId: CommandId.make(`claude-quota:project:${input.attempt}`),
++      // Bootstrap reuses whichever project already owns the folder.
++      projectId: ProjectId.make("claude-quota-activation"),
++      title: "Claude quota timers",
++      workspaceRoot: input.root,
++      createWorkspaceRootIfMissing: true,
++      defaultModelSelection: input.modelSelection,
++    });
++    return project;
++  },
++);
++
++/**
++ * A usage limit holds the thread's queue, and each queued message stays bound to the empty
++ * account, so T3 would never start it. The user's messages are queued again on the new account,
++ * in order, and the queue is released. Each copy is queued before its original is cancelled, so
++ * a failure leaves a duplicate rather than losing a message.
++ */
++export const moveQueuedMessages = Effect.fn("ClaudeQuotaAutopilot.moveQueuedMessages")(function* (
++  threads: ThreadManagement.ThreadManagementService["Service"],
++  input: {
++    readonly threadId: ThreadId;
++    readonly from: ProviderInstanceId;
++    readonly modelSelection: ModelSelection;
++  },
++) {
++  const { runs } = yield* threads.getThreadRecords(input.threadId, ["runs"]);
++  const queued = runs
++    .filter((run) => run.status === "queued" && run.providerInstanceId === input.from)
++    .toSorted(
++      (left, right) =>
++        (left.queuePosition ?? left.ordinal) - (right.queuePosition ?? right.ordinal),
++    );
++  if (queued.length === 0) return 0;
++  const { messages } = yield* threads.getThreadRecords(input.threadId, ["messages"], {
++    messageIds: queued.map((run) => run.userMessageId),
++  });
++  let moved = 0;
++  for (const run of queued) {
++    const message = messages.find((candidate) => candidate.id === run.userMessageId);
++    // Wakes, delegated results and workflow scripts carry provider state a copy would lose.
++    if (
++      message === undefined ||
++      message.role !== "user" ||
++      message.notification !== undefined ||
++      message.delegatedCompletion !== undefined ||
++      message.workflowScript === true
++    )
++      continue;
++    const key = `claude-quota:requeue:${run.id}`;
++    yield* threads.dispatch({
++      type: "message.dispatch",
++      commandId: CommandId.make(key),
++      messageId: MessageId.make(key),
++      threadId: input.threadId,
++      text: message.text,
++      attachments: message.attachments,
++      ...(message.context === undefined ? {} : { context: message.context }),
++      modelSelection: input.modelSelection,
++      dispatchMode: { type: "queue_after_active" },
++      createdBy: message.createdBy,
++      creationSource: "server",
++    });
++    yield* threads.dispatch({
++      type: "queued-run.cancel",
++      commandId: CommandId.make(`${key}:cancel`),
++      threadId: input.threadId,
++      runId: run.id,
++    });
++    moved += 1;
++  }
++  if (moved > 0)
++    yield* threads.dispatch({
++      type: "queue.resume",
++      commandId: CommandId.make(`claude-quota:queue-resume:${queued[0]!.id}`),
++      threadId: input.threadId,
++    });
++  return moved;
++});
++
++const pct = (value: number | null) => (value === null ? "unknown" : `${Math.round(value)}%`);
++
++const make = Effect.gen(function* () {
++  const fs = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const config = yield* ServerConfig.ServerConfig;
++  const registry = yield* Registry.ProviderRegistry;
++  const projections = yield* ProjectionStore.ProjectionStoreV2;
++  const threads = yield* ThreadManagement.ThreadManagementService;
++  const launch = yield* ThreadLaunch.ThreadLaunchService;
++  const projects = yield* Projects.ProjectService;
++
++  const configPath = path.join(config.stateDir, "claude-quota.json");
++  const logPath = path.join(config.logsDir, "claude-quota.ndjson");
++  const activationRoot = path.join(config.stateDir, "claude-quota-activation");
++  let lastSweepMs = 0;
++  let lastHeartbeatMs = 0;
++  let lastConfigText: string | null = null;
++  // Set from the event stream, so a run the limit stops is handled within seconds.
++  let failureSweepAtMs: number | null = null;
++  const lastProbeMs = new Map<string, number>();
++  const fullSinceMs = new Map<string, number>();
++  const lastActivationMs = new Map<string, number>();
++  // Only a delivered "hi" can be confirmed; a failed one must not claim the user's own usage.
++  const awaitingConfirmation = new Set<string>();
++  const lastResetAtMs = new Map<string, number>();
++  const lastReported = new Map<string, string>();
++  const limitHitAtMs = new Map<string, number>();
++  const limitedRuns = new Map<
++    string,
++    { readonly account: string; readonly idleCompaction: boolean; readonly atMs: number }
++  >();
++  const continuesAtMs = new Map<string, Array<number>>();
++
++  // Logging must never stop the sweep, so every failure is swallowed here.
++  const log = Effect.fn("ClaudeQuotaAutopilot.log")(function* (
++    event: string,
++    fields: Record<string, unknown>,
++  ) {
++    const line = `${encodeJson({ at: DateTime.formatIso(yield* DateTime.now), event, ...fields })}\n`;
++    const size = yield* fs.stat(logPath).pipe(
++      Effect.map((info) => Number(info.size)),
++      Effect.orElseSucceed(() => 0),
++    );
++    if (size > LOG_ROTATE_BYTES) yield* fs.rename(logPath, `${logPath}.1`);
++    yield* fs.makeDirectory(config.logsDir, { recursive: true });
++    yield* fs.writeFileString(logPath, line, { flag: "a" });
++  }, Effect.ignore());
++
++  /** Logs a decision only when it differs from the last one with the same key. */
++  const report = (key: string, event: string, fields: Record<string, unknown>) => {
++    const signature = `${event}:${encodeJson(fields)}`;
++    if (lastReported.get(key) === signature) return Effect.void;
++    lastReported.set(key, signature);
++    return log(event, fields);
++  };
++
++  const readConfig = Effect.gen(function* () {
++    const text = yield* fs.readFileString(configPath).pipe(Effect.orElseSucceed(() => null));
++    if (text === null) return null;
++    const decoded = yield* decodeConfig(text).pipe(Effect.option);
++    if (text !== lastConfigText) {
++      lastConfigText = text;
++      yield* decoded._tag === "Some"
++        ? log("config", { ...decoded.value })
++        : log("config_invalid", { path: configPath });
++    }
++    return decoded._tag === "Some" ? decoded.value : null;
++  });
++
++  const sampleAccounts = Effect.fn("ClaudeQuotaAutopilot.sampleAccounts")(function* (
++    settings: AutopilotConfig,
++    nowMs: number,
++  ) {
++    let providers = yield* registry.getProviders;
++    const pool: ReadonlyArray<string> =
++      settings.accounts.length > 0
++        ? settings.accounts
++        : providers
++            .filter((provider) => provider.driver === CLAUDE_DRIVER)
++            .map((provider) => provider.instanceId);
++    for (const id of pool) {
++      const provider = providers.find((candidate) => candidate.instanceId === id);
++      if (!provider) continue;
++      const checkedAtMs = provider.usageLimits ? Date.parse(provider.usageLimits.checkedAt) : 0;
++      if (nowMs - checkedAtMs < PROBE_EVERY_MS) continue;
++      if (nowMs - (lastProbeMs.get(id) ?? 0) < PROBE_EVERY_MS) continue;
++      lastProbeMs.set(id, nowMs);
++      providers = yield* registry.refreshInstance(provider.instanceId);
++    }
++    return providers.filter((provider) => pool.includes(provider.instanceId));
++  });
++
++  const activate = Effect.fn("ClaudeQuotaAutopilot.activate")(function* (
++    provider: ServerProvider,
++    settings: AutopilotConfig,
++    nowMs: number,
++  ) {
++    const modelSelection = activationSelection(provider, settings);
++    if (!modelSelection) return;
++    const attempt = `${provider.instanceId}:${nowMs}`;
++    const project = yield* ensureActivationProject(fs, projects, {
++      root: activationRoot,
++      modelSelection,
++      attempt,
++    });
++    yield* launch.launch({
++      commandId: CommandId.make(`claude-quota:hi:${attempt}`),
++      threadId: ThreadId.make(`${ACTIVATION_THREAD_PREFIX}${provider.instanceId}-${nowMs}`),
++      projectId: project.id,
++      title: `Quota timer · ${provider.displayName ?? provider.instanceId}`,
++      generateTitle: false,
++      modelSelection,
++      runtimeMode: "approval-required",
++      interactionMode: "default",
++      workspaceStrategy: { type: "root" },
++      initialMessage: { text: ACTIVATION_TEXT, attachments: [] },
++      createdBy: "user",
++      creationSource: "server",
++    });
++  });
++
++  /** The next moment a reported window ends, when a sweep should look again. */
++  const nextResetSweepMs = (afterMs: number) => {
++    let next: number | null = null;
++    for (const resetMs of lastResetAtMs.values()) {
++      const dueMs = resetMs + RESET_MARGIN_MS;
++      if (dueMs > afterMs && (next === null || dueMs < next)) next = dueMs;
++    }
++    return next;
++  };
++
++  const sweep = Effect.fn("ClaudeQuotaAutopilot.sweep")(function* () {
++    const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
++    const resetDueMs = nextResetSweepMs(lastSweepMs);
++    if (
++      nowMs - lastSweepMs < SWEEP_EVERY_MS &&
++      (failureSweepAtMs === null || nowMs < failureSweepAtMs) &&
++      (resetDueMs === null || nowMs < resetDueMs)
++    )
++      return;
++    lastSweepMs = nowMs;
++    failureSweepAtMs = null;
++    const settings = yield* readConfig;
++    if (lastHeartbeatMs === 0) yield* log("started", { config: configPath });
++    if (!settings?.enabled) {
++      if (nowMs - lastHeartbeatMs >= HEARTBEAT_MS) {
++        lastHeartbeatMs = nowMs;
++        yield* log("heartbeat", { enabled: false });
++      }
++      return;
++    }
++
++    const providers = yield* sampleAccounts(settings, nowMs);
++    const probed = providers.map(readAccountQuota);
++    for (const account of probed) {
++      if (account.sessionResetsAtMs !== null) {
++        lastResetAtMs.set(account.id, account.sessionResetsAtMs);
++      }
++      yield* report(`account:${account.id}`, "account", {
++        account: account.id,
++        ready: account.ready,
++        sessionRemaining: account.sessionRemaining,
++        sessionResetsAt: isoOrNull(account.sessionResetsAtMs),
++        weeklyRemaining: account.weeklyRemaining,
++        ...(account.modelWeekly?.length ? { modelWeekly: account.modelWeekly } : {}),
++      });
++    }
++    if (nowMs - lastHeartbeatMs >= HEARTBEAT_MS) {
++      lastHeartbeatMs = nowMs;
++      yield* log("heartbeat", {
++        enabled: true,
++        observeOnly: settings.observeOnly,
++        accounts: probed.map((account) => ({
++          account: account.id,
++          sessionRemaining: account.sessionRemaining,
++          checkedAt: isoOrNull(account.checkedAtMs),
++        })),
++      });
++    }
++
++    // Settled threads stay in: auto-settle marks idle ones, and their next message still needs quota.
++    const shells = (yield* projections.getShellSnapshot({ location: "active" })).threads;
++
++    // Limited runs say more than a probe up to 5 minutes old: which account is empty right now,
++    // and whether the stopped run was work or only T3's idle compaction.
++    const histories = new Map<string, ThreadHistory>();
++    for (const thread of shells) {
++      const failedAtMs = limitFailureAtMs(thread);
++      if (failedAtMs === null || nowMs - failedAtMs > CONTINUE_WITHIN_MS) continue;
++      const runId = thread.latestRunId!;
++      let run = limitedRuns.get(runId);
++      if (run === undefined) {
++        const records = yield* projections
++          .getThreadRecords(thread.id, ["runs"], { runIds: [runId] })
++          .pipe(Effect.option);
++        const record = Option.isSome(records)
++          ? records.value.runs.find((candidate) => candidate.id === runId)
++          : undefined;
++        if (record === undefined) continue;
++        run = {
++          account: record.providerInstanceId,
++          idleCompaction: record.userMessageId.startsWith("idle-compact:"),
++          atMs: failedAtMs,
++        };
++        limitedRuns.set(runId, run);
++      }
++      limitHitAtMs.set(run.account, Math.max(limitHitAtMs.get(run.account) ?? 0, failedAtMs));
++      const recent = (continuesAtMs.get(thread.id) ?? []).filter(
++        (atMs) => nowMs - atMs <= CONTINUE_WITHIN_MS,
++      );
++      histories.set(thread.id, {
++        limitedRunAccount: run.account,
++        limitedRunWasIdleCompaction: run.idleCompaction,
++        recentContinues: recent.length,
++      });
++    }
++    const accounts = applyLimitHits(applyKnownResets(probed, lastResetAtMs, nowMs), limitHitAtMs);
++    const sessionLeft = (id: string) =>
++      pct(accounts.find((account) => account.id === id)?.sessionRemaining ?? null);
++
++    for (const thread of shells) {
++      const plan = planThreadSwitch(thread, accounts, settings, nowMs, histories.get(thread.id));
++      if (!plan) continue;
++      const from = thread.modelSelection.instanceId;
++      const base = { threadId: thread.id, title: thread.title, from };
++      if (plan.kind === "gave_up") {
++        yield* report(`thread:${thread.id}`, "continue_gave_up", {
++          ...base,
++          continues: plan.continues,
++          message: `Stopped resuming "${thread.title}" after ${plan.continues} tries; it resumes when ${from} resets.`,
++        });
++        continue;
++      }
++      if (plan.kind === "no_target") {
++        yield* report(`thread:${thread.id}`, "no_target", {
++          ...base,
++          model: thread.modelSelection.model,
++          message: `"${thread.title}" needs another account, but none has quota left for ${thread.modelSelection.model}.`,
++        });
++        continue;
++      }
++      if (plan.kind === "held") {
++        yield* report(`thread:${thread.id}`, "held_background", {
++          ...base,
++          backgroundTasks: plan.backgroundTasks,
++          message: `Kept "${thread.title}" on ${from} (${sessionLeft(from)} left) so its ${plan.backgroundTasks} background task(s) keep running.`,
++        });
++        continue;
++      }
++      const fields = {
++        ...base,
++        to: plan.target.id,
++        toRemaining: plan.target.sessionRemaining,
++        message:
++          plan.kind === "continue"
++            ? `Resumed "${thread.title}" on ${plan.target.id} (${pct(plan.target.sessionRemaining)} left) after ${from} ran out.`
++            : `Moved "${thread.title}" from ${from} (${sessionLeft(from)} left) to ${plan.target.id} (${pct(plan.target.sessionRemaining)} left).`,
++      };
++      if (settings.observeOnly) {
++        yield* report(`thread:${thread.id}`, `would_${plan.kind}`, fields);
++        continue;
++      }
++      const moved = yield* threads.dispatch(plan.command).pipe(
++        Effect.andThen(
++          report(
++            `thread:${thread.id}`,
++            plan.kind === "continue" ? "continued" : "switched",
++            fields,
++          ),
++        ),
++        Effect.as(true),
++        Effect.catchCause((cause) =>
++          report(`thread:${thread.id}`, "switch_failed", {
++            ...fields,
++            message: `Could not move "${thread.title}" to ${plan.target.id}.`,
++            cause: describe(cause),
++          }).pipe(Effect.as(false)),
++        ),
++      );
++      if (!moved || plan.kind !== "continue") continue;
++      continuesAtMs.set(thread.id, [
++        ...(continuesAtMs.get(thread.id) ?? []).filter(
++          (atMs) => nowMs - atMs <= CONTINUE_WITHIN_MS,
++        ),
++        nowMs,
++      ]);
++      yield* moveQueuedMessages(threads, {
++        threadId: thread.id,
++        from,
++        modelSelection: { ...thread.modelSelection, instanceId: plan.target.id },
++      }).pipe(
++        Effect.flatMap((messages) =>
++          messages === 0
++            ? Effect.void
++            : log("queue_moved", {
++                threadId: thread.id,
++                to: plan.target.id,
++                messages,
++                message: `Queued ${messages} waiting message(s) of "${thread.title}" on ${plan.target.id}.`,
++              }),
++        ),
++        Effect.catchCause((cause) =>
++          log("queue_move_failed", { threadId: thread.id, cause: describe(cause) }),
++        ),
++      );
++    }
++
++    if (!settings.observeOnly) {
++      for (const thread of finishedActivationThreads(shells, nowMs)) {
++        yield* threads
++          .dispatch({
++            type: "thread.delete",
++            commandId: CommandId.make(`claude-quota:hi-delete:${thread.id}`),
++            threadId: thread.id,
++          })
++          .pipe(
++            Effect.catchCause((cause) =>
++              report(`activation-delete:${thread.id}`, "activation_delete_failed", {
++                threadId: thread.id,
++                cause: describe(cause),
++              }),
++            ),
++          );
++      }
++    }
++
++    for (const provider of settings.activate ? providers : []) {
++      const account = readAccountQuota(provider);
++      const sentAtMs = lastActivationMs.get(account.id);
++      if (!isAccountFull(account, settings, nowMs)) {
++        if (awaitingConfirmation.has(account.id) && isActivationConfirmed(account, sentAtMs)) {
++          awaitingConfirmation.delete(account.id);
++          lastActivationMs.delete(account.id);
++          yield* log("activation_confirmed", {
++            account: account.id,
++            sessionResetsAt: isoOrNull(account.sessionResetsAtMs),
++            message: `${account.id}'s 5-hour window is running until ${isoOrNull(account.sessionResetsAtMs)}.`,
++          });
++        }
++        fullSinceMs.delete(account.id);
++      } else if (!fullSinceMs.has(account.id)) {
++        fullSinceMs.set(account.id, account.checkedAtMs);
++      }
++      const resetAtMs = lastResetAtMs.get(account.id);
++      const busy = shells.some(
++        (thread) =>
++          thread.modelSelection.instanceId === account.id &&
++          (thread.activeRunId !== null ||
++            RUNNING.has(thread.status) ||
++            (resetAtMs !== undefined &&
++              thread.latestRunRequestedAt != null &&
++              DateTime.toEpochMillis(thread.latestRunRequestedAt) >= resetAtMs)),
++      );
++      const due = isActivationDue({
++        account,
++        fullSinceMs: fullSinceMs.get(account.id),
++        lastAttemptMs: lastActivationMs.get(account.id),
++        lastResetAtMs: resetAtMs,
++        busy,
++        config: settings,
++        nowMs,
++      });
++      if (!due) continue;
++      if (settings.observeOnly) {
++        yield* report(`activation:${account.id}`, "would_activate", { account: account.id });
++        continue;
++      }
++      lastActivationMs.set(account.id, nowMs);
++      yield* activate(provider, settings, nowMs).pipe(
++        Effect.andThen(
++          Effect.suspend(() => {
++            awaitingConfirmation.add(account.id);
++            return log("activation_sent", {
++              account: account.id,
++              text: ACTIVATION_TEXT,
++              message: `Started ${account.id}'s 5-hour window with a short "Hi".`,
++            });
++          }),
++        ),
++        Effect.catchCause((cause) =>
++          log("activation_failed", {
++            account: account.id,
++            cause: describe(cause),
++            message: `Could not start ${account.id}'s 5-hour window.`,
++          }),
++        ),
++      );
++    }
++
++    // State per run and thread would otherwise grow for as long as the server runs.
++    const liveThreads = new Set<string>(shells.map((thread) => thread.id));
++    for (const [runId, run] of limitedRuns) {
++      if (nowMs - run.atMs > CONTINUE_WITHIN_MS) limitedRuns.delete(runId);
++    }
++    for (const [threadId, times] of continuesAtMs) {
++      if (!liveThreads.has(threadId) || times.every((atMs) => nowMs - atMs > CONTINUE_WITHIN_MS))
++        continuesAtMs.delete(threadId);
++    }
++    for (const key of lastReported.keys()) {
++      const separator = key.indexOf(":");
++      const scope = key.slice(0, separator);
++      if (
++        (scope === "thread" || scope === "activation-delete") &&
++        !liveThreads.has(key.slice(separator + 1))
++      )
++        lastReported.delete(key);
++    }
++  });
++
++  /**
++   * A run that just failed may be a usage limit: look within seconds instead of a minute.
++   * Untraced because it sees every domain event, streaming deltas included.
++   */
++  const onDomainEvent = Effect.fnUntraced(function* (event: OrchestrationV2DomainEvent) {
++    if (event.type !== "run.updated" || event.payload.status !== "failed") return;
++    const atMs = DateTime.toEpochMillis(yield* DateTime.now) + FAILURE_SETTLE_MS;
++    if (failureSweepAtMs === null || atMs < failureSweepAtMs) failureSweepAtMs = atMs;
++  });
++
++  return {
++    sweep: sweep().pipe(
++      Effect.catchCause((cause) => report("sweep", "sweep_failed", { cause: describe(cause) })),
++    ),
++    // Without it the minute sweep still finds limited runs, only later.
++    events: Stream.runForEach(threads.streamDomainEvents, onDomainEvent).pipe(
++      Effect.catchCause((cause) => log("events_failed", { cause: describe(cause) })),
++    ),
++  };
++});
++
++export const layer = Layer.effectDiscard(
++  Effect.gen(function* () {
++    const { sweep, events } = yield* make;
++    const scheduler = yield* Scheduler.Scheduler;
++    yield* scheduler.register("claude-quota-autopilot", sweep);
++    yield* forkParked(events);
++  }),
++);
+diff --git a/apps/server/src/orchestration-v2/runtimeLayer.test.ts b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
+index 9db0564c..907c2f9b 100644
+--- a/apps/server/src/orchestration-v2/runtimeLayer.test.ts
++++ b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
+@@ -1,5 +1,6 @@
+ import { SourceControlProviderKind } from "@t3tools/contracts";
+ import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
++import * as ClaudeQuotaAutopilot from "./ClaudeQuotaAutopilot.ts";
+ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+ import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+@@ -40,6 +41,7 @@ import * as Path from "effect/Path";
+ import * as Option from "effect/Option";
+ import * as Queue from "effect/Queue";
+ import * as Stream from "effect/Stream";
++import * as Schema from "effect/Schema";
+ import * as TestClock from "effect/testing/TestClock";
+ import * as SqlClient from "effect/sql/SqlClient";
+ 
+@@ -6316,3 +6318,286 @@ it.layer(layerQueueResumeDisabledInstanceTest)(
+     );
+   },
+ );
++
++const decodeAutopilotConfig = Schema.decodeUnknownSync(ClaudeQuotaAutopilot.AutopilotConfig);
++
++// Same layer: it enables the alternate instance the autopilot moves work to.
++it.layer(layerQueueResumeDisabledInstanceTest)("claude quota autopilot", (it) => {
++  it.effect("claude quota autopilot deletes an activation thread once its run is over", () =>
++    Effect.gen(function* () {
++      const orchestrator = yield* Orchestrator.OrchestratorV2;
++      const threads = yield* ThreadManagementService.ThreadManagementService;
++      const events = yield* EventSink.EventSinkV2;
++      const threadId = ThreadId.make("claude-quota-hi-codex-1");
++      const projectId = ProjectId.make("quota-autopilot:activation");
++      const now = yield* DateTime.now;
++      yield* seedProject({
++        projectId,
++        title: "Claude quota timers",
++        workspaceRoot: process.cwd(),
++        defaultModelSelection: modelSelection,
++        createdAt: DateTime.formatIso(now),
++      });
++      yield* orchestrator.dispatch({
++        type: "thread.create",
++        commandId: CommandId.make("quota-autopilot:activation:create"),
++        threadId,
++        projectId,
++        title: "Quota timer",
++        modelSelection,
++        runtimeMode: "approval-required",
++        interactionMode: "default",
++        branch: null,
++        worktreePath: null,
++        createdBy: "user",
++        creationSource: "server",
++      });
++      yield* orchestrator.dispatch({
++        type: "message.dispatch",
++        commandId: CommandId.make("quota-autopilot:activation:hi"),
++        threadId,
++        messageId: MessageId.make("quota-autopilot:activation:hi"),
++        text: "Only reply with 'Hi'.",
++        attachments: [],
++        dispatchMode: { type: "defer_start" },
++        createdBy: "user",
++        creationSource: "server",
++      });
++      const shellOf = Effect.map(orchestrator.getShellSnapshot(), (snapshot) =>
++        snapshot.threads.filter((thread) => thread.id === threadId),
++      );
++      const nowMs = DateTime.toEpochMillis(now);
++      assert.lengthOf(ClaudeQuotaAutopilot.finishedActivationThreads(yield* shellOf, nowMs), 0);
++
++      const [run] = (yield* orchestrator.getThreadProjection(threadId)).runs;
++      yield* events.write({
++        events: [
++          {
++            id: EventId.make("quota-autopilot:activation:done"),
++            type: "run.updated",
++            threadId,
++            occurredAt: now,
++            payload: { ...run!, status: "completed", completedAt: now },
++          },
++        ],
++      });
++      const finished = ClaudeQuotaAutopilot.finishedActivationThreads(yield* shellOf, nowMs);
++      assert.lengthOf(finished, 1);
++      yield* threads.dispatch({
++        type: "thread.delete",
++        commandId: CommandId.make(`claude-quota:hi-delete:${threadId}`),
++        threadId,
++      });
++      assert.lengthOf(yield* shellOf, 0);
++    }),
++  );
++
++  it.effect.each(["limited", "low"] as const)(
++    "claude quota autopilot moves a %s thread to the account with quota left",
++    (scenario) =>
++      Effect.gen(function* () {
++        const orchestrator = yield* Orchestrator.OrchestratorV2;
++        const threads = yield* ThreadManagementService.ThreadManagementService;
++        const events = yield* EventSink.EventSinkV2;
++        const threadId = ThreadId.make(`quota-autopilot:${scenario}`);
++        const projectId = ProjectId.make(`quota-autopilot:project:${scenario}`);
++        const now = yield* DateTime.now;
++        const nowMs = DateTime.toEpochMillis(now);
++        yield* seedProject({
++          projectId,
++          title: "Quota project",
++          workspaceRoot: process.cwd(),
++          defaultModelSelection: modelSelection,
++          createdAt: DateTime.formatIso(now),
++        });
++        yield* orchestrator.dispatch({
++          type: "thread.create",
++          commandId: CommandId.make(`quota-autopilot:create:${scenario}`),
++          threadId,
++          projectId,
++          title: "Quota thread",
++          modelSelection,
++          runtimeMode: "full-access",
++          interactionMode: "default",
++          branch: null,
++          worktreePath: null,
++          createdBy: "user",
++          creationSource: "web",
++        });
++        let scheduledResume: ReturnType<typeof limitRecoveryCommand> = null;
++        let followUpRunId: string | null = null;
++        if (scenario === "limited") {
++          yield* orchestrator.dispatch({
++            type: "message.dispatch",
++            commandId: CommandId.make(`quota-autopilot:start:${scenario}`),
++            threadId,
++            messageId: MessageId.make(`quota-autopilot:start:${scenario}`),
++            text: "Start work.",
++            attachments: [],
++            dispatchMode: { type: "defer_start" },
++            createdBy: "user",
++            creationSource: "web",
++          });
++          // The user queued a follow-up before the limit stopped the run.
++          yield* orchestrator.dispatch({
++            type: "message.dispatch",
++            commandId: CommandId.make(`quota-autopilot:follow-up:${scenario}`),
++            threadId,
++            messageId: MessageId.make(`quota-autopilot:follow-up:${scenario}`),
++            text: "Then run the tests.",
++            attachments: [],
++            dispatchMode: { type: "queue_after_active" },
++            createdBy: "user",
++            creationSource: "web",
++          });
++          const [source, followUp] = (yield* orchestrator.getThreadProjection(threadId)).runs as [
++            OrchestrationV2Run,
++            OrchestrationV2Run,
++          ];
++          assert.equal(followUp.status, "queued");
++          followUpRunId = followUp.id;
++          const resetAt = DateTime.formatIso(DateTime.add(now, { hours: 2 }));
++          yield* events.write({
++            events: [
++              {
++                id: EventId.make(`quota-autopilot:stop:${scenario}`),
++                type: "run.updated",
++                threadId,
++                occurredAt: now,
++                payload: { ...source, status: "failed", completedAt: now },
++              },
++              {
++                id: EventId.make(`quota-autopilot:hold:${scenario}`),
++                type: "run.updated",
++                threadId,
++                occurredAt: now,
++                payload: { ...followUp, queueHeld: true },
++              },
++              {
++                id: EventId.make(`quota-autopilot:error:${scenario}`),
++                type: "turn-item.updated",
++                threadId,
++                occurredAt: now,
++                payload: {
++                  id: TurnItemId.make(`quota-autopilot:error:${scenario}`),
++                  type: "error",
++                  threadId,
++                  runId: source.id,
++                  nodeId: source.rootNodeId,
++                  providerThreadId: null,
++                  providerTurnId: null,
++                  nativeItemRef: null,
++                  parentItemId: null,
++                  ordinal: 2,
++                  status: "failed",
++                  title: "Usage limit reached",
++                  startedAt: now,
++                  completedAt: now,
++                  updatedAt: now,
++                  failure: {
++                    class: "usage_limit",
++                    message: "Plan limit reached.",
++                    code: "usageLimitExceeded",
++                    retryable: null,
++                    resetAt,
++                  },
++                },
++              },
++            ],
++          });
++          // The stock reset worker arms itself too; it must stay harmless after the move.
++          const limited = (yield* orchestrator.getShellSnapshot()).threads.find(
++            (thread) => thread.id === threadId,
++          )!;
++          yield* orchestrator.dispatch(limitRecoveryCommand(limited, true, nowMs)!);
++          const armed = (yield* orchestrator.getShellSnapshot()).threads.find(
++            (thread) => thread.id === threadId,
++          )!;
++          scheduledResume = limitRecoveryCommand(armed, true, Date.parse(resetAt));
++          assert.isNotNull(scheduledResume);
++        }
++
++        const shell = (yield* orchestrator.getShellSnapshot()).threads.find(
++          (thread) => thread.id === threadId,
++        )!;
++        const account = (id: ProviderInstanceId, sessionRemaining: number) => ({
++          id,
++          ready: true,
++          sessionRemaining,
++          sessionResetsAtMs: null,
++          weeklyRemaining: 50,
++          models: [modelSelection.model],
++          checkedAtMs: nowMs,
++        });
++        const config = decodeAutopilotConfig({
++          enabled: true,
++          accounts: [modelSelection.instanceId, alternateInstanceId],
++        });
++        const plan = ClaudeQuotaAutopilot.planThreadSwitch(
++          shell,
++          [
++            account(modelSelection.instanceId, scenario === "limited" ? 0 : 3),
++            account(alternateInstanceId, 80),
++          ],
++          config,
++          nowMs,
++        );
++        assert.equal(plan?.kind, scenario === "limited" ? "continue" : "switch");
++        if (plan?.kind !== "continue" && plan?.kind !== "switch")
++          return assert.fail("expected a move");
++        yield* threads.dispatch(plan.command);
++        // A repeated sweep reuses the command id and must not start more work.
++        yield* threads.dispatch(plan.command);
++
++        const after = yield* orchestrator.getThreadProjection(threadId);
++        assert.equal(after.thread.modelSelection.instanceId, alternateInstanceId);
++        if (scenario === "limited") {
++          const continued = after.runs.find((run) =>
++            run.userMessageId.startsWith("claude-quota:continue:"),
++          );
++          assert.equal(continued?.status, "starting");
++          assert.equal(continued?.providerInstanceId, alternateInstanceId);
++
++          const moveQueue = ClaudeQuotaAutopilot.moveQueuedMessages(threads, {
++            threadId,
++            from: modelSelection.instanceId,
++            modelSelection: { ...modelSelection, instanceId: alternateInstanceId },
++          });
++          assert.equal(yield* moveQueue, 1);
++          // A repeated sweep finds nothing left on the empty account.
++          assert.equal(yield* moveQueue, 0);
++          const requeued = yield* orchestrator.getThreadProjection(threadId);
++          assert.equal(requeued.runs.find((run) => run.id === followUpRunId)?.status, "cancelled");
++          const copy = requeued.runs.find((run) =>
++            run.userMessageId.startsWith("claude-quota:requeue:"),
++          );
++          assert.deepEqual(
++            [copy?.providerInstanceId, copy?.status, copy?.queueHeld === true],
++            [alternateInstanceId, "queued", false],
++          );
++          assert.equal(
++            requeued.messages.find((message) => message.id === copy?.userMessageId)?.text,
++            "Then run the tests.",
++          );
++
++          const runCount = requeued.runs.length;
++          yield* TestClock.adjust("2 hours");
++          yield* orchestrator.dispatch(scheduledResume!);
++          assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, runCount);
++        } else {
++          assert.lengthOf(after.runs, 0);
++        }
++        const moved = (yield* orchestrator.getShellSnapshot()).threads.find(
++          (thread) => thread.id === threadId,
++        )!;
++        assert.isNull(
++          ClaudeQuotaAutopilot.planThreadSwitch(
++            moved,
++            [account(modelSelection.instanceId, 3), account(alternateInstanceId, 80)],
++            config,
++            nowMs,
++          ),
++        );
++      }),
++  );
++});
+diff --git a/apps/server/src/orchestration-v2/runtimeLayer.ts b/apps/server/src/orchestration-v2/runtimeLayer.ts
+index ad4c7ecd..2ac9931d 100644
+--- a/apps/server/src/orchestration-v2/runtimeLayer.ts
++++ b/apps/server/src/orchestration-v2/runtimeLayer.ts
+@@ -1,4 +1,5 @@
+ import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
++import * as ClaudeQuotaAutopilot from "./ClaudeQuotaAutopilot.ts";
+ import * as Scheduler from "../scheduling/Scheduler.ts";
+ import * as Layer from "effect/Layer";
+ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+@@ -376,6 +377,16 @@ export const layerProduction = Layer.mergeAll(
+       ),
+     ),
+   ),
++  ClaudeQuotaAutopilot.layer.pipe(
++    Layer.provide(
++      Layer.mergeAll(
++        ProjectionStore.layer,
++        layerThreadManagementProvided,
++        layerThreadLaunchProvided,
++        layerProjectService,
++      ),
++    ),
++  ),
+   layerProviderContinuationWorkerProvided,
+   layerAgentSessionImporterProvided,
+   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),

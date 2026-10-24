@@ -1,0 +1,6 @@
+# Local state: official backups, build output, run logs
+backup/
+work/
+# Per-machine paths and personal notes
+t3-quota.local.json
+NOTES*.md

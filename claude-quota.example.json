@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "observeOnly": false,
+  "accounts": [],
+  "switchAtRemainingPercent": 5,
+  "activate": true,
+  "activateAfterFullMinutes": 10,
+  "activationModel": "claude-haiku-5-5",
+  "activationEffort": "low"
+}
