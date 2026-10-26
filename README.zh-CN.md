@@ -11,15 +11,16 @@
 - **提前启动空闲账号的 5 小时窗口**：某账号的窗口到期、又没人在用时，给它发一条极短的消息，
   这样等你需要用它时，新窗口已经在倒计时了。
 
-它是打进 T3 Code 的一个服务端文件，只调用 T3 已有的命令和服务：不改界面、协议、编排器或
-Provider 适配器，所以 T3 出新版时很容易继续套用。
+自动驾驶复用 T3 已有的切号、额度查询和限额恢复服务。补丁还修复了手动刷新仍命中旧额度缓存、
+以及 Claude 明确拒绝请求时没有更新额度的问题。
 
 > 请自行确认你使用多个账号的方式符合 Anthropic 的条款。
 
 ## 判断规则
 
-对话一撞额度（来自 T3 的事件流），或账号已知的 5 小时窗口到点，补丁会立刻醒来处理；平时每分钟巡检一次。
-这些检查只读本地状态。额度用 T3 自带的 Usage 查询读取，约 5.5 分钟一次，不发送模型消息。
+对话一撞额度、唤醒对话一收到回复（来自 T3 的事件流），或账号已知的 5 小时窗口到点，补丁会立刻醒来处理；平时每分钟巡检一次。
+额度用 T3 自带的 Usage 查询读取：使用中的账号约每分钟一次，空闲账号每五分钟一次，不发送模型消息。
+手动刷新 Limits 会绕过 T3 的额度缓存；上游的数据本身仍可能延迟。
 
 **换号**（5 小时或周额度剩余 ≤ `switchAtRemainingPercent` 就算"不够"）：
 
@@ -28,14 +29,18 @@ Provider 适配器，所以 T3 出新版时很容易继续套用。
   T3 卡在没额度账号上的排队消息，会在新账号上重新排队。
 - 只换账号，模型、思考强度等选项不变。目标账号必须提供这个模型，5 小时和周额度都要高于阈值。
   Max 套餐里"某个模型专用"的周额度，只影响使用该模型的对话。
-- **无号可换** → 什么都不改，日志记 `no_target`，交给 T3 自带的"额度重置后自动继续"（`autoResumeLimitedThreads`）。
+- **暂时全部没额度** → 被限额打断的对话迁到五小时额度最早恢复、且适用周额度仍大于零的账号，
+  优先选择周额度高于阈值的账号。发送一次 Continue，让目标账号返回限额，再由 T3 自带的
+  **Snoozed / Auto-resume** 等待到点恢复；这两个设置需要开启。已经在最佳等待账号上时不重复发送。
+  没有明确的未来重置时间或可用周额度时保持原账号，记录 `no_target`。
 - 正在运行的对话、等待审批的对话、你手动标为结束（settled）的对话、Claude 子代理对话都不动。
   T3 自动标为结束的对话仍会换号，因为它们的下一条消息同样需要额度。
 - **挂着后台任务的空闲对话**（Monitor、后台命令、后台子代理）不提前换号：换号会关闭旧账号的 Claude 会话，
   这些任务会跟着被杀掉。它们留在原账号（`held_background`），等真的被额度打断再续跑；
   续跑消息会列出被停掉的任务，让新账号把还需要的重新启动。
+  T3 自己的自动化（Automations，定时任务）不属于会话任务：换号和重启都不影响它，绑定在对话上的自动化每次都跟随对话当前的账号。
 - 刚撞过额度的账号，在下一次查询之前当作 0%。
-- 同一对话 5 小时内最多自动续跑 3 次，之后记 `continue_gave_up`。
+- 同一对话 5 小时内最多正常自动续跑 3 次，之后记 `continue_gave_up`；仍允许转到最佳等待账号。
 - T3 空闲时自动 `/compact` 撞上额度，不算需要续跑的工作。
 
 **激活**（`activate: true`）：账号已就绪、空闲、周额度不低、没有正在计时的 5 小时窗口时，
@@ -69,7 +74,7 @@ cd t3code-claude-quota
 1. 读出已安装的 T3 版本，首次运行时把 T3 Code 克隆到 `work\t3code`。
 2. 切到该版本的 tag，套上 `claude-quota.patch`，跑补丁的测试。
 3. 用与官方发行版相同的公开构建配置构建 T3（从官方安装包里复制，所以 T3 Connect 登录和中继照常可用），并核对。
-4. 重新打包官方程序：只替换编译出来的桌面端和服务端代码。
+4. 重新打包官方程序：更新服务端、网页代码和版本号，保留官方桌面外壳及原生文件。
 5. 用真实账号启动一个隔离副本，只观察不动作，检查每个账号都能读到额度。不会发送任何消息。
 6. 把官方文件备份到 `backup\official-<版本>`，换上补丁版并重启 T3。
    重启由一次性的计划任务执行，所以从 T3 里面运行脚本也没问题。
@@ -107,7 +112,7 @@ cd t3code-claude-quota
 `-Follow` 持续查看。每个动作都带一句英文 `message`，例如
 `Moved "Refactor auth" from Claude2 (3% left) to Claude4 (76% left).` 日志包含对话标题和标识符，不包含消息正文；分享前请检查日志内容。
 
-事件：`account`、`switched`、`continued`、`queue_moved`、`no_target`、`held_background`、`continue_gave_up`、
+事件：`account`、`switched`、`continued`、`waiting_for_reset`、`queue_moved`、`no_target`、`held_background`、`continue_gave_up`、
 `activation_sent`、`activation_confirmed`、`would_*`（仅观察模式）、`*_failed`。
 
 ## 升级 T3
@@ -124,15 +129,14 @@ cd t3code-claude-quota
 
 ## 移植到新版 T3
 
-补丁改动 `apps/server/src/orchestration-v2/`：新文件 `ClaudeQuotaAutopilot.ts`（全部逻辑）和
-`ClaudeQuotaAutopilot.test.ts`，`runtimeLayer.ts` 里注册 layer 的几行，以及 `runtimeLayer.test.ts` 里的一个集成测试。
-套不上时，通常是 `runtimeLayer.ts` 周围的代码变了，或 `ServerProvider`、线程 shell 的字段改了名。
+核心逻辑在 `apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.ts`。补丁还涉及额度刷新服务和 RPC、
+网页与手机端的刷新入口、Claude 限额映射及对应回归测试。请在干净的源码副本上移植，避免混入无关改动。
 
 1. 在 T3 源码里 `git checkout -f --detach v<版本>`，然后 `git apply` 补丁，或手工移植。
 2. 在 `apps/server` 里运行 `vp test run src/orchestration-v2/ClaudeQuotaAutopilot.test.ts src/orchestration-v2/runtimeLayer.test.ts`
    和 `vp run typecheck`；对改过的文件运行 `vp fmt` 和 `vp lint`。
 3. 在源码根目录重新生成补丁：先 `git add -N` 两个新文件，
-   `git diff --binary v<版本> -- apps/server/src/orchestration-v2/ > claude-quota.patch`，再 `git reset` 它们。
+   `git diff --binary v<版本> -- apps packages > claude-quota.patch`，再 `git reset` 它们。
 4. 运行 `.\Update-T3-Quota.ps1`。
 
 ## 已知限制

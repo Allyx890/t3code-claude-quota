@@ -23,6 +23,13 @@ $logPath = Join-Path $root ("work\swap-{0}-{1}.log" -f $Mode.ToLower(), (Get-Dat
 function Log([string]$m) { Add-Content -LiteralPath $logPath -Value ('{0} {1}' -f (Get-Date -Format 'HH:mm:ss'), $m) -Encoding UTF8 }
 function InstallProcesses { @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($install + '\', [StringComparison]::OrdinalIgnoreCase) }) }
 function Replace([string]$from, [string]$to) {
+    $target = [IO.Path]::GetFullPath($to)
+    $allowed = @((Join-Path $install 'resources'), (Join-Path $root 'backup'))
+    $inside = $false
+    foreach ($parent in $allowed) {
+        if ($target.StartsWith([IO.Path]::GetFullPath($parent).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { $inside = $true }
+    }
+    if (!$inside) { throw "Refusing to replace files outside T3 resources or quota backups: $target" }
     if (Test-Path -LiteralPath $to) { Remove-Item -LiteralPath $to -Recurse -Force }
     Copy-Item -LiteralPath $from -Destination $to -Recurse -Force
 }
@@ -71,6 +78,15 @@ try {
     Log 'T3 stopped.'
     Start-Sleep -Seconds 2
 
+    # Preserve the build being replaced as well as the original official backup.
+    $previousResources = Join-Path $root ('backup\previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '\resources')
+    New-Item -ItemType Directory -Path $previousResources -Force | Out-Null
+    foreach ($n in $items + @('app-update.yml')) {
+        $previousItem = Join-Path $resources $n
+        if (Test-Path -LiteralPath $previousItem) { Replace $previousItem (Join-Path $previousResources $n) }
+    }
+    Log "Previous build backed up to $previousResources."
+
     # 2. Back up the official files once; an existing backup is never overwritten.
     if ($Mode -eq 'Deploy' -and !$haveBackup) {
         New-Item -ItemType Directory -Force -Path (Join-Path $backup 'resources') | Out-Null
@@ -90,9 +106,9 @@ try {
         }
         Log "Resources swapped ($Mode) from $source."
     } catch {
-        Log ('Swap failed: ' + $_.Exception.Message + ' -> restoring official files')
-        foreach ($n in $items) { Replace (Join-Path $backup "resources\$n") (Join-Path $resources $n) }
-        Copy-Item -LiteralPath (Join-Path $backup 'resources\app-update.yml') -Destination (Join-Path $resources 'app-update.yml') -Force
+        Log ('Swap failed: ' + $_.Exception.Message + ' -> restoring previous files')
+        foreach ($n in $items) { Replace (Join-Path $previousResources $n) (Join-Path $resources $n) }
+        Copy-Item -LiteralPath (Join-Path $previousResources 'app-update.yml') -Destination (Join-Path $resources 'app-update.yml') -Force
         throw
     }
 
@@ -103,6 +119,7 @@ try {
 
     # 4. Start T3 again and wait for the autopilot to report in.
     $since = (Get-Date).ToUniversalTime()
+    $ok = $true
     Launch
     if ($Mode -eq 'Deploy') {
         $deadline = (Get-Date).AddSeconds(180)
@@ -118,6 +135,16 @@ try {
         if ($ok) { Log 'Verified: the new build logged "started".' } else { Log 'WARNING: no "started" entry within 180 s.' }
         if (Test-Path -LiteralPath $quotaLog) { Get-Content -LiteralPath $quotaLog -Tail 8 -Encoding UTF8 | ForEach-Object { Log ('  ' + $_) } }
     }
+    @{
+        mode = $Mode
+        verified = $ok
+        finishedAt = (Get-Date).ToUniversalTime().ToString('o')
+        previousResources = $previousResources
+        logPath = $logPath
+        appHash = (Get-FileHash -LiteralPath (Join-Path $resources 'app.asar')).Hash
+        serverHash = (Get-FileHash -LiteralPath (Join-Path $resources 'server.asar')).Hash
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'work\deployment-latest.json') -Encoding utf8
+    if (!$ok) { throw 'The resources were copied, but no new startup was confirmed. See the deployment receipt and previous-build backup.' }
     Log 'Done.'
 } catch {
     Log ('ERROR: ' + $_.Exception.Message)

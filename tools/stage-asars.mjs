@@ -1,5 +1,7 @@
 // Builds patched copies of the official app.asar / server.asar: identical except
-// for the compiled desktop and server bundles, which come from the patched build.
+// for the compiled server/web bundle and package version metadata.
+// Keep the official desktop shell: this patch changes no desktop source, and
+// rebuilding its shared RPC schemas would cause unrelated bundle churn.
 // Native files keep exactly the official unpacked layout.
 //
 // usage: node stage-asars.mjs <officialResourcesDir> <sourceCheckout> <outResourcesDir> <version>
@@ -38,8 +40,10 @@ for (const { name, bundle } of archives) {
   const unpacked = existsSync(`${original}.unpacked`)
     ? walk(`${original}.unpacked`).map((p) => posix(relative(`${original}.unpacked`, p))).sort()
     : [];
-  rmSync(join(tree, bundle), { recursive: true, force: true });
-  cpSync(join(source, bundle), join(tree, bundle), { recursive: true, filter: (p) => !p.endsWith('.map') });
+  if (name === 'server.asar') {
+    rmSync(join(tree, bundle), { recursive: true, force: true });
+    cpSync(join(source, bundle), join(tree, bundle), { recursive: true, filter: (p) => !p.endsWith('.map') });
+  }
   const pkgPath = join(tree, 'package.json');
   const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
   pkg.version = version;

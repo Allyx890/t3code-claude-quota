@@ -82,10 +82,7 @@ if (!$SkipBuild) {
             Set-Content -LiteralPath $lockMark -Value $lockHash
         }
         Step 'Testing'
-        Push-Location -LiteralPath 'apps\server'
-        try {
-            Native 'tests' { & $vp test run src/orchestration-v2/ClaudeQuotaAutopilot.test.ts src/orchestration-v2/runtimeLayer.test.ts *> (Join-Path $work 'tests.log') }
-        } finally { Pop-Location }
+        Native 'tests' { & $vp test run apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts apps/server/src/orchestration-v2/runtimeLayer.test.ts apps/server/src/provider/claudeUsageLimits.test.ts apps/server/src/provider/ProviderRegistry.test.ts apps/server/src/ws.test.ts packages/client-runtime/src/state/usage.test.ts apps/mobile/src/features/usage/UsageLimitsSection.test.ts *> (Join-Path $work 'tests.log') }
         Step 'Building'
         $releaseFiles = 'apps/server/package.json', 'apps/desktop/package.json', 'apps/web/package.json', 'packages/contracts/package.json'
         # Official CI bakes public config (T3 Connect sign-in, relay, telemetry channel) into the
@@ -117,6 +114,7 @@ Native 'build config check' { & $node (Join-Path $root 'tools\build-config.mjs')
 # 4. Isolated check with the real accounts, observe only.
 Step 'Checking an isolated copy against the real accounts (observe only)'
 $smoke = Join-Path $work 'smoke'
+if ([IO.Path]::GetFullPath($smoke) -ne [IO.Path]::GetFullPath((Join-Path $root 'work\smoke'))) { throw 'Unexpected smoke directory.' }
 if (Test-Path -LiteralPath $smoke) { Remove-Item -LiteralPath $smoke -Recurse -Force }
 $smokeInstall = Join-Path $smoke 'install'
 $smokeHome = Join-Path $smoke 'home'
@@ -140,7 +138,7 @@ foreach ($name in @(Get-ChildItem Env: | Where-Object { $_.Name -match '^(CLAUDE
 $saved['APPDATA'] = $env:APPDATA
 $env:APPDATA = Join-Path $smoke 'roaming'; $env:T3CODE_HOME = $smokeHome; $env:T3CODE_PORT = '14775'
 $env:T3CODE_DISABLE_AUTO_UPDATE = 'true'; $env:T3CODE_DESKTOP_APP_USER_MODEL_ID = 'local.t3code.quota.check'; $env:T3CODE_DEV_SEED = '0'
-try { $proc = Start-Process -FilePath (Join-Path $smokeInstall 'T3 Code (Beta).exe') -PassThru }
+try { $proc = Start-Process -FilePath (Join-Path $smokeInstall 'T3 Code (Beta).exe') -WindowStyle Hidden -PassThru }
 finally {
     foreach ($name in 'T3CODE_HOME', 'T3CODE_PORT', 'T3CODE_DISABLE_AUTO_UPDATE', 'T3CODE_DESKTOP_APP_USER_MODEL_ID', 'T3CODE_DEV_SEED') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
     foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
