@@ -21,6 +21,8 @@
 对话一撞额度、唤醒对话一收到回复（来自 T3 的事件流），或账号已知的 5 小时窗口到点，补丁会立刻醒来处理；平时每分钟巡检一次。
 额度用 T3 自带的 Usage 查询读取：使用中的账号约每分钟一次，空闲账号每五分钟一次，不发送模型消息。
 手动刷新 Limits 会绕过 T3 的额度缓存；上游的数据本身仍可能延迟。
+Claude 探测逐个启动，同一账号的并发刷新合并为一次查询。自动查询失败后逐步退避，最长十五分钟，
+手动刷新可绕过退避；优先检查使用中的账号。失败时保留最后成功的额度及原查询时间，不把旧百分比当成本次刷新成功。
 
 **换号**（5 小时或周额度剩余 ≤ `switchAtRemainingPercent` 就算"不够"）：
 
@@ -113,6 +115,7 @@ cd t3code-claude-quota
 `Moved "Refactor auth" from Claude2 (3% left) to Claude4 (76% left).` 日志包含对话标题和标识符，不包含消息正文；分享前请检查日志内容。
 
 事件：`account`、`switched`、`continued`、`waiting_for_reset`、`queue_moved`、`no_target`、`held_background`、`continue_gave_up`、
+`usage_probe_deferred`、`usage_probe_recovered`、
 `activation_sent`、`activation_confirmed`、`would_*`（仅观察模式）、`*_failed`。
 
 ## 升级 T3

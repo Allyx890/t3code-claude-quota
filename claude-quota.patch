@@ -707,19 +707,386 @@ index ad4c7ecd..2ac9931d 100644
    layerProviderContinuationWorkerProvided,
    layerAgentSessionImporterProvided,
    EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),
+diff --git a/apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts b/apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts
+index 80740b0a..6f4bb9ee 100644
+--- a/apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts
++++ b/apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts
+@@ -1,10 +1,242 @@
+ // @effect-diagnostics nodeBuiltinImport:off - cleanup uses Node's retrying rm, which the FileSystem service does not expose.
+ import { vi } from "vite-plus/test";
+ import { assert, it } from "@effect/vitest";
++import { ClaudeSettings } from "@t3tools/contracts";
++import { query } from "@anthropic-ai/claude-agent-sdk";
++import * as Effect from "effect/Effect";
++import * as Fiber from "effect/Fiber";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++import * as Semaphore from "effect/Semaphore";
++import { ChildProcessSpawner } from "effect/process";
++import * as TestClock from "effect/testing/TestClock";
++import * as SnapshotProbe from "@t3tools/provider-core/server/snapshotProbe";
++import * as Shell from "@t3tools/shared/shell";
+ 
+-import { buildClaudeCapabilitiesProbeQueryOptions } from "./ClaudeProvider.ts";
++import {
++  buildClaudeCapabilitiesProbeQueryOptions,
++  checkClaudeProviderStatus,
++  ClaudeCapabilitiesProbeGate,
++  probeClaudeCapabilities,
++} from "./ClaudeProvider.ts";
+ 
+ vi.mock("@anthropic-ai/claude-agent-sdk", { spy: true });
++vi.mock("./Drivers/ClaudeHome.ts", () => ({
++  makeClaudeEnvironment: (settings: ClaudeSettings) =>
++    Effect.succeed({ CLAUDE_CONFIG_DIR: settings.homePath }),
++  hasClaudeManagedMcpConfig: () => Effect.succeed(false),
++}));
++vi.mock("./Drivers/ClaudeExecutable.ts", () => ({
++  resolveClaudeSdkExecutablePath: () => Effect.succeed("/mock/claude"),
++}));
++vi.mock("./Drivers/ClaudeSkills.ts", () => ({ discoverClaudeSkills: () => Effect.succeed([]) }));
++const settings = Schema.decodeSync(ClaudeSettings)({ enabled: true });
++const probeLayer = Layer.mergeAll(FileSystem.layerNoop({}), Path.layer);
++
++it.effect("allows injecting a gate and cancels a queued probe without starting the SDK", () =>
++  Effect.gen(function* () {
++    const gate = yield* Semaphore.make(1);
++    yield* gate.take(1);
++    using _query = vi.mocked(query).mockImplementation(() => {
++      throw new Error("queued probe must not initialize");
++    });
++    const fiber = yield* probeClaudeCapabilities(settings).pipe(
++      Effect.provideService(ClaudeCapabilitiesProbeGate, gate),
++      Effect.forkChild,
++    );
++    yield* TestClock.adjust(26_000);
++    assert.equal(_query.mock.calls.length, 0);
++    yield* Fiber.interrupt(fiber);
++    yield* gate.release(1);
++    assert.equal(_query.mock.calls.length, 0);
++  }).pipe(Effect.provide(probeLayer)),
++);
++
++it.effect.each(["timeout", "loggedOut", "unsupported"] as const)(
++  "reports %s without treating old usage as fresh success",
++  (outcome) =>
++    Effect.gen(function* () {
++      using _spawn = vi
++        .spyOn(Shell, "resolveSpawnCommand")
++        .mockReturnValue(
++          Effect.succeed({ command: "/mock/claude", args: ["--version"], shell: false }),
++        );
++      using _collect = vi
++        .spyOn(SnapshotProbe, "spawnAndCollect")
++        .mockReturnValue(Effect.succeed({ code: 0, stdout: "2.1.100", stderr: "" }));
++      const result = yield* checkClaudeProviderStatus(
++        settings,
++        () =>
++          outcome === "timeout"
++            ? Effect.never.pipe(Effect.timeout(25_000))
++            : Effect.succeed({
++                email: undefined,
++                subscriptionType: undefined,
++                tokenSource: outcome === "loggedOut" ? "none" : "apiKey",
++                apiKeySource: undefined,
++                apiProvider: undefined,
++                slashCommands: [],
++                usage: { rate_limits_available: false, rate_limits: null },
++              }),
++        {},
++      ).pipe(Effect.forkChild);
++      yield* TestClock.adjust(25_000);
++      const status = yield* Fiber.join(result);
++      assert.equal(
++        status.auth.status,
++        outcome === "timeout"
++          ? "unknown"
++          : outcome === "loggedOut"
++            ? "unauthenticated"
++            : "authenticated",
++      );
++      assert.equal(
++        status.usageLimits?.unavailable?.reason,
++        outcome === "timeout"
++          ? "probeFailed"
++          : outcome === "unsupported"
++            ? "unsupported"
++            : undefined,
++      );
++    }).pipe(
++      Effect.provide(
++        Layer.mergeAll(
++          probeLayer,
++          Layer.mock(ChildProcessSpawner.ChildProcessSpawner)({
++            spawn: () => Effect.die("mock spawnAndCollect must not start a process"),
++          }),
++        ),
++      ),
++    ),
++);
++
++it.effect(
++  "serializes different accounts without spending the initialization deadline in the queue",
++  () =>
++    Effect.gen(function* () {
++      const initialized = Promise.withResolvers<{}>();
++      const usageStarted = Promise.withResolvers<void>();
++      const usage = Promise.withResolvers<{ rate_limits_available: false }>();
++      const entered = Promise.withResolvers<void>();
++      const signals: AbortSignal[] = [];
++      const prompts: Promise<IteratorResult<unknown>>[] = [];
++      const homes: Array<string | undefined> = [];
++      let usageCalls = 0;
++      using _query = vi.mocked(query).mockImplementation(({ options, prompt }) => {
++        signals.push(options!.abortController!.signal);
++        homes.push(options!.env?.CLAUDE_CONFIG_DIR);
++        prompts.push((prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]().next());
++        const first = homes.length === 1;
++        entered.resolve();
++        return {
++          initializationResult: () => (first ? initialized.promise : Promise.resolve({})),
++          usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: () => {
++            usageCalls++;
++            if (!first) return Promise.resolve({ rate_limits_available: false });
++            usageStarted.resolve();
++            return usage.promise;
++          },
++        } as unknown as ReturnType<typeof query>;
++      });
++      const owner = yield* probeClaudeCapabilities({
++        ...settings,
++        homePath: "/mock/account-a",
++      }).pipe(Effect.forkChild);
++      yield* Effect.promise(() => entered.promise);
++      const next = yield* probeClaudeCapabilities(
++        {
++          ...settings,
++          homePath: "/mock/account-b",
++        },
++        undefined,
++        undefined,
++        false,
++      ).pipe(Effect.forkChild);
++      yield* TestClock.adjust(24_000);
++      assert.deepEqual(homes, ["/mock/account-a"]);
++      initialized.resolve({});
++      yield* Effect.promise(() => usageStarted.promise);
++      yield* TestClock.adjust(3_000);
++      assert.deepEqual(homes, ["/mock/account-a"]);
++      usage.resolve({ rate_limits_available: false });
++      yield* Fiber.join(owner);
++      yield* Fiber.join(next);
++      assert.deepEqual(homes, ["/mock/account-a", "/mock/account-b"]);
++      assert.equal(usageCalls, 1);
++      assert.isTrue(signals.every((signal) => signal.aborted));
++      assert.deepEqual(yield* Effect.promise(() => Promise.all(prompts)), [
++        { value: undefined, done: true },
++        { value: undefined, done: true },
++      ]);
++    }).pipe(Effect.provide(probeLayer)),
++);
++
++it.effect.each(["failure", "cancel", "timeout"] as const)(
++  "releases the probe and permit after owner %s",
++  (outcome) =>
++    Effect.gen(function* () {
++      const entered = Promise.withResolvers<void>();
++      const initialized = Promise.withResolvers<{}>();
++      const signals: AbortSignal[] = [];
++      const prompts: Promise<IteratorResult<unknown>>[] = [];
++      using _query = vi.mocked(query).mockImplementation(({ options, prompt }) => {
++        signals.push(options!.abortController!.signal);
++        prompts.push((prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]().next());
++        const first = signals.length === 1;
++        if (!first) assert.isTrue(signals[0]!.aborted);
++        entered.resolve();
++        return {
++          initializationResult: () => (first ? initialized.promise : Promise.resolve({})),
++          usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: () =>
++            Promise.resolve({ rate_limits_available: false }),
++        } as unknown as ReturnType<typeof query>;
++      });
++      const owner = yield* probeClaudeCapabilities(settings).pipe(Effect.result, Effect.forkChild);
++      yield* Effect.promise(() => entered.promise);
++      const next = yield* probeClaudeCapabilities(settings).pipe(Effect.forkChild);
++      yield* TestClock.adjust(0);
++      assert.equal(signals.length, 1);
++      if (outcome === "cancel") {
++        yield* Fiber.interrupt(owner);
++      } else {
++        if (outcome === "failure") initialized.reject(new Error("mock initialization failure"));
++        else yield* TestClock.adjust(25_000);
++        const result = yield* Fiber.join(owner);
++        assert.equal(result._tag, "Failure");
++      }
++      yield* Fiber.join(next);
++      assert.equal(signals.length, 2);
++      assert.isTrue(signals.every((signal) => signal.aborted));
++      assert.isTrue((yield* Effect.promise(() => Promise.all(prompts))).every((item) => item.done));
++    }).pipe(Effect.provide(probeLayer)),
++);
++
++it.effect("keeps initialization when usage exceeds its separate four second deadline", () =>
++  Effect.gen(function* () {
++    const usageStarted = Promise.withResolvers<void>();
++    const usage = Promise.withResolvers<never>();
++    let signal: AbortSignal | undefined;
++    using _query = vi.mocked(query).mockImplementation(({ options }) => {
++      signal = options!.abortController!.signal;
++      return {
++        initializationResult: () => Promise.resolve({ account: { email: "mock@example.invalid" } }),
++        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: () => {
++          usageStarted.resolve();
++          return usage.promise;
++        },
++      } as unknown as ReturnType<typeof query>;
++    });
++    const fiber = yield* probeClaudeCapabilities(settings).pipe(Effect.forkChild);
++    yield* Effect.promise(() => usageStarted.promise);
++    yield* TestClock.adjust(4_000);
++    const result = yield* Fiber.join(fiber);
++    assert.equal(result.email, "mock@example.invalid");
++    assert.equal(result.usage, undefined);
++    assert.isTrue(signal?.aborted);
++  }).pipe(Effect.provide(probeLayer)),
++);
+ 
+ it("drops strict MCP mode, and only that, next to an administrator's managed-mcp.json", () => {
+   const options = buildClaudeCapabilitiesProbeQueryOptions({
+diff --git a/apps/server/src/provider/ClaudeProvider.ts b/apps/server/src/provider/ClaudeProvider.ts
+index 18f3b850..7f7e18f9 100644
+--- a/apps/server/src/provider/ClaudeProvider.ts
++++ b/apps/server/src/provider/ClaudeProvider.ts
+@@ -6,6 +6,7 @@ import {
+   type ServerProviderResetCredits,
+ } from "@t3tools/contracts";
+ import * as Cause from "effect/Cause";
++import * as Context from "effect/Context";
+ import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+@@ -13,6 +14,7 @@ import * as Option from "effect/Option";
+ import * as Path from "effect/Path";
+ import * as Ref from "effect/Ref";
+ import * as Result from "effect/Result";
++import * as Semaphore from "effect/Semaphore";
+ import { ChildProcess, ChildProcessSpawner } from "effect/process";
+ import { createModelCapabilities } from "@t3tools/shared/model";
+ import { resolveSpawnCommand } from "@t3tools/shared/shell";
+@@ -194,6 +196,11 @@ function claudeAuthStatus(
+ // Amazon Bedrock initializes far slower than first-party auth: the SDK boots the Bedrock
+ // backend and runs the `awsAuthRefresh` credential hook before returning account info.
+ const CAPABILITIES_PROBE_TIMEOUT_MS = 25_000;
++// All instances share the cached reference default; model turns never acquire this gate.
++export const ClaudeCapabilitiesProbeGate = Context.Reference<Semaphore.Semaphore>(
++  "server/provider/ClaudeCapabilitiesProbeGate",
++  { defaultValue: () => Semaphore.makeUnsafe(1) },
++);
+ // Native CLI startup on Windows can exceed the shared probe deadline.
+ const CLAUDE_VERSION_CHECK_TIMEOUT_MS = 20_000;
+ 
+@@ -346,14 +353,16 @@ function waitForAbortSignal(signal: AbortSignal): Promise<void> {
+  * initialization IPC (returning account info and slash commands) but never starts an API
+  * request to Anthropic.
+  */
+-const probeClaudeCapabilities = (
++const probeClaudeCapabilities = Effect.fn("probeClaudeCapabilities")(function* (
+   claudeSettings: ClaudeSettings,
+   environment?: NodeJS.ProcessEnv,
+   cwd?: string,
+   includeUsage = true,
+-) => {
++) {
++  const gate = yield* ClaudeCapabilitiesProbeGate;
++  // Acquire before starting either deadline, and abort before returning the permit.
+   const abort = new AbortController();
+-  return Effect.gen(function* () {
++  return yield* Effect.gen(function* () {
+     const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, environment);
+     const executablePath = yield* resolveClaudeSdkExecutablePath(
+       claudeSettings.binaryPath,
+@@ -389,7 +398,9 @@ const probeClaudeCapabilities = (
+         const usageCheckedAt = DateTime.formatIso(yield* DateTime.now);
+         const usageResult = includeUsage
+           ? yield* Effect.tryPromise(() =>
+-              q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }),
++              q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({
++                skipBehaviors: true,
++              }),
+             ).pipe(Effect.timeout(DEFAULT_TIMEOUT_MS), Effect.result)
+           : undefined;
+         const usage =
+@@ -427,8 +438,9 @@ const probeClaudeCapabilities = (
+     Effect.tapError((error) =>
+       Effect.logWarning("Claude capability probe failed.", { errorTag: error._tag }),
+     ),
++    gate.withPermits(1),
+   );
+-};
++});
+ 
+ type ClaudeCapabilitiesProbeError = Effect.Error<ReturnType<typeof probeClaudeCapabilities>>;
+ 
+@@ -555,6 +567,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
+         auth: { status: "unknown" },
+         message:
+           "Claude Agent CLI is installed but failed to run. Timed out while running command.",
++        usageLimits: makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" }),
+       },
+     });
+   }
+@@ -620,6 +633,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
+             ? `Timed out after ${CAPABILITIES_PROBE_TIMEOUT_MS / 1_000}s while checking Claude account status.`
+             : "Claude Agent CLI failed while checking account status."
+           : "Could not verify Claude authentication status from initialization result.",
++        usageLimits: makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" }),
+       },
+     });
+   }
+diff --git a/apps/server/src/provider/Drivers/ClaudeDriver.ts b/apps/server/src/provider/Drivers/ClaudeDriver.ts
+index 86832d53..e7179b76 100644
+--- a/apps/server/src/provider/Drivers/ClaudeDriver.ts
++++ b/apps/server/src/provider/Drivers/ClaudeDriver.ts
+@@ -28,6 +28,7 @@ import * as ClaudeResetCredits from "../claudeResetCredits.ts";
+ import * as ResetCreditCoordinator from "../resetCreditCoordinator.ts";
+ import {
+   checkClaudeProviderStatus,
++  ClaudeCapabilitiesProbeGate,
+   makePendingClaudeProvider,
+   probeClaudeCapabilities,
+   probeClaudeWorkspaceSnapshot,
+@@ -124,6 +125,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+     const fileSystem = yield* FileSystem.FileSystem;
+     const path = yield* Path.Path;
++    const capabilitiesProbeGate = yield* ClaudeCapabilitiesProbeGate;
+     // The server cwd is $HOME in packaged desktop builds, and `claude`
+     // wrappers that scope themselves to their cwd refuse to run there.
+     const { stateDir } = yield* ServerConfig.ServerConfig;
+@@ -234,6 +236,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+           ),
+           Effect.provideService(FileSystem.FileSystem, fileSystem),
+           Effect.provideService(Path.Path, path),
++          Effect.provideService(ClaudeCapabilitiesProbeGate, capabilitiesProbeGate),
+         ),
+       {
+         capacity: 1,
 diff --git a/apps/server/src/provider/ProviderRegistry.test.ts b/apps/server/src/provider/ProviderRegistry.test.ts
-index a278470c..61940fb2 100644
+index a278470c..00f7c0bd 100644
 --- a/apps/server/src/provider/ProviderRegistry.test.ts
 +++ b/apps/server/src/provider/ProviderRegistry.test.ts
-@@ -5,6 +5,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+@@ -5,6 +5,8 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
  import * as NodeServices from "@effect/platform-node/NodeServices";
  import { describe, it, assert, expect } from "@effect/vitest";
  import * as DateTime from "effect/DateTime";
 +import * as Cache from "effect/Cache";
++import * as Cause from "effect/Cause";
  import * as Deferred from "effect/Deferred";
  import * as Effect from "effect/Effect";
  import * as Exit from "effect/Exit";
-@@ -36,6 +37,7 @@ import { ChildProcessSpawner } from "effect/process";
+@@ -36,6 +38,7 @@ import { ChildProcessSpawner } from "effect/process";
  import { deepMerge } from "@t3tools/shared/Struct";
  import { createModelCapabilities } from "@t3tools/shared/model";
  import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
@@ -727,7 +1094,7 @@ index a278470c..61940fb2 100644
  
  import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
  import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
-@@ -203,12 +205,16 @@ function layerMockSpawner(
+@@ -203,12 +206,16 @@ function layerMockSpawner(
      code: number;
    },
  ) {
@@ -750,7 +1117,7 @@ index a278470c..61940fb2 100644
    );
  }
  
-@@ -316,9 +322,190 @@ const layerTestNodeServices = Layer.mergeAll(
+@@ -316,9 +323,310 @@ const layerTestNodeServices = Layer.mergeAll(
    }),
  );
  
@@ -760,6 +1127,7 @@ index a278470c..61940fb2 100644
 +  const release = yield* Deferred.make<void>();
 +  const block = yield* Ref.make(false);
 +  const fail = yield* Ref.make(false);
++  const interrupt = yield* Ref.make(false);
 +  const probes = [0, 0];
 +  const invalidations = [0, 0];
 +  const instances = yield* Effect.forEach([0, 1], (index) =>
@@ -787,6 +1155,7 @@ index a278470c..61940fb2 100644
 +              yield* Deferred.succeed(started, undefined);
 +              yield* Deferred.await(release);
 +            }
++            if (yield* Ref.get(interrupt)) return yield* Effect.interrupt;
 +            if (yield* Ref.get(fail)) return yield* Effect.die("usage probe failed");
 +            const checkedAt = `2026-10-25T00:0${attempt}:00.000Z`;
 +            return {
@@ -857,7 +1226,7 @@ index a278470c..61940fb2 100644
 +    ),
 +  );
 +  const registry = yield* ProviderRegistry.ProviderRegistry.pipe(Effect.provide(services));
-+  return { registry, instances, probes, invalidations, block, fail, started, release };
++  return { registry, instances, probes, invalidations, block, fail, interrupt, started, release };
 +});
 +
  it.layer(
@@ -918,22 +1287,140 @@ index a278470c..61940fb2 100644
 +        yield* Ref.set(block, true);
 +        const older = yield* registry.refresh().pipe(Effect.forkChild);
 +        yield* Deferred.await(started);
-+        const requested = yield* Deferred.make<void>();
-+        const fresh = yield* Deferred.succeed(requested, undefined).pipe(
-+          Effect.andThen(
-+            registry.refreshUsageSnapshot(targeted ? instances[0]!.instanceId : undefined),
-+          ),
-+          Effect.forkChild,
++        const fresh = yield* Effect.forEach([0, 1, 2], () =>
++          registry
++            .refreshUsageSnapshot(targeted ? instances[0]!.instanceId : undefined)
++            .pipe(Effect.forkChild({ startImmediately: true })),
 +        );
-+        yield* Deferred.await(requested);
++        assert.deepEqual(invalidations, [0, 0]);
 +        yield* Ref.set(block, false);
 +        yield* Deferred.succeed(release, undefined);
 +        yield* Fiber.join(older);
-+        const result = yield* Fiber.join(fresh);
++        const results = yield* Effect.forEach(fresh, Fiber.join);
 +        assert.deepEqual(probes, targeted ? [2, 1] : [2, 2]);
 +        assert.deepEqual(invalidations, targeted ? [1, 0] : [1, 1]);
 +        assert.equal(
-+          result.find((p) => p.instanceId === instances[0]!.instanceId)?.usageLimits?.checkedAt,
++          results[0]!.find((p) => p.instanceId === instances[0]!.instanceId)?.usageLimits
++            ?.checkedAt,
++          "2026-10-25T00:02:00.000Z",
++        );
++      }).pipe(Effect.scoped),
++  );
++  it.effect("shares one fresh probe between three callers and releases successful claims", () =>
++    Effect.gen(function* () {
++      const { registry, instances, probes, invalidations, block, started, release } =
++        yield* makeUsageRefreshFixture;
++      const id = instances[0]!.instanceId;
++      yield* Ref.set(block, true);
++      const first = yield* registry.refreshUsageSnapshot(id).pipe(Effect.forkChild);
++      yield* Deferred.await(started);
++      const others = yield* Effect.forEach([0, 1], () =>
++        registry.refreshUsageSnapshot(id).pipe(Effect.forkChild({ startImmediately: true })),
++      );
++      const before = yield* registry.getProviders;
++      assert.deepEqual(
++        yield* registry.refreshUsageSnapshot(ProviderInstanceId.make("missing")),
++        before,
++      );
++      assert.deepEqual(probes, [1, 0]);
++      yield* Ref.set(block, false);
++      yield* Deferred.succeed(release, undefined);
++      const results = yield* Effect.forEach([first, ...others], Fiber.join);
++      assert.deepEqual(probes, [1, 0]);
++      assert.deepEqual(invalidations, [1, 0]);
++      for (const result of results) assert.deepEqual(result, results[0]);
++      yield* registry.refreshUsageSnapshot(id);
++      assert.deepEqual(probes, [2, 0]);
++      assert.deepEqual(invalidations, [2, 0]);
++    }).pipe(Effect.scoped),
++  );
++
++  it.effect.each([false, true])("serializes fresh probes across instances (all=%s)", (all) =>
++    Effect.gen(function* () {
++      const { registry, instances, probes, block, started, release } =
++        yield* makeUsageRefreshFixture;
++      yield* Ref.set(block, true);
++      const first = yield* registry
++        .refreshUsageSnapshot(all ? undefined : instances[0]!.instanceId)
++        .pipe(Effect.forkChild);
++      yield* Deferred.await(started);
++      const second = yield* registry
++        .refreshUsageSnapshot(instances[1]!.instanceId)
++        .pipe(Effect.forkChild({ startImmediately: true }));
++      assert.deepEqual(probes, [1, 0]);
++      yield* Ref.set(block, false);
++      yield* Deferred.succeed(release, undefined);
++      yield* Effect.forEach([first, second], Fiber.join);
++      assert.equal(probes[0], 1);
++      assert.isAtLeast(probes[1]!, 1);
++    }).pipe(Effect.scoped),
++  );
++
++  it.effect("keeps shared fresh work alive when its first caller is interrupted", () =>
++    Effect.gen(function* () {
++      const { registry, instances, probes, block, started, release } =
++        yield* makeUsageRefreshFixture;
++      const id = instances[0]!.instanceId;
++      yield* Ref.set(block, true);
++      const first = yield* registry.refreshUsageSnapshot(id).pipe(Effect.forkChild);
++      yield* Deferred.await(started);
++      const second = yield* registry
++        .refreshUsageSnapshot(id)
++        .pipe(Effect.forkChild({ startImmediately: true }));
++      yield* Fiber.interrupt(first);
++      yield* Ref.set(block, false);
++      yield* Deferred.succeed(release, undefined);
++      const result = yield* Fiber.join(second);
++      assert.deepEqual(probes, [1, 0]);
++      assert.equal(
++        result.find((p) => p.instanceId === id)?.usageLimits?.checkedAt,
++        "2026-10-25T00:01:00.000Z",
++      );
++      yield* registry.refreshUsageSnapshot(id);
++      assert.deepEqual(probes, [2, 0]);
++    }).pipe(Effect.scoped),
++  );
++
++  it.effect.each(["failure", "interrupt"] as const)(
++    "releases fresh completion after %s and permits recovery",
++    (mode) =>
++      Effect.gen(function* () {
++        const {
++          registry,
++          instances,
++          probes,
++          invalidations,
++          block,
++          fail,
++          interrupt,
++          started,
++          release,
++        } = yield* makeUsageRefreshFixture;
++        const id = instances[0]!.instanceId;
++        const before = yield* registry.getProviders;
++        yield* Ref.set(mode === "failure" ? fail : interrupt, true);
++        yield* Ref.set(block, true);
++        const first = yield* registry.refreshUsageSnapshot(id).pipe(Effect.forkChild);
++        yield* Deferred.await(started);
++        const second = yield* registry
++          .refreshUsageSnapshot(id)
++          .pipe(Effect.forkChild({ startImmediately: true }));
++        yield* Deferred.succeed(release, undefined);
++        for (const fiber of [first, second]) {
++          const exit = yield* Fiber.await(fiber);
++          if (mode === "interrupt") {
++            assert.isTrue(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause));
++          } else assert.deepEqual(exit, Exit.succeed(before));
++        }
++        assert.deepEqual(probes, [1, 0]);
++        yield* Ref.set(block, false);
++        yield* Ref.set(fail, false);
++        yield* Ref.set(interrupt, false);
++        const recovered = yield* registry.refreshUsageSnapshot(id);
++        assert.deepEqual(probes, [2, 0]);
++        assert.deepEqual(invalidations, [2, 0]);
++        assert.equal(
++          recovered.find((p) => p.instanceId === id)?.usageLimits?.checkedAt,
 +          "2026-10-25T00:02:00.000Z",
 +        );
 +      }).pipe(Effect.scoped),
@@ -942,7 +1429,7 @@ index a278470c..61940fb2 100644
      it.effect("uses the app-server account and model list for provider status", () =>
        Effect.gen(function* () {
 diff --git a/apps/server/src/provider/ProviderRegistry.ts b/apps/server/src/provider/ProviderRegistry.ts
-index 97da44aa..338b09f5 100644
+index 97da44aa..a93dde73 100644
 --- a/apps/server/src/provider/ProviderRegistry.ts
 +++ b/apps/server/src/provider/ProviderRegistry.ts
 @@ -64,6 +64,11 @@ export class ProviderRegistry extends Context.Service<
@@ -990,10 +1477,42 @@ index 97da44aa..338b09f5 100644
            ),
          ),
        );
-@@ -672,6 +692,24 @@ export const layer = Layer.effect(
+@@ -672,6 +692,54 @@ export const layer = Layer.effect(
        return yield* refreshOneSource(providerSource);
      });
  
++    const freshUsageSemaphore = yield* Semaphore.make(1);
++    const freshUsageInFlight = new WeakMap<ProviderInstance, RefreshAllCompletion>();
++    const refreshFreshUsageInstance = Effect.fn("refreshFreshUsageInstance")(function* (
++      instance: ProviderInstance,
++    ) {
++      const completion = yield* Effect.uninterruptibleMask((restore) =>
++        Effect.gen(function* () {
++          const current = freshUsageInFlight.get(instance);
++          if (current) return current;
++          const completion = Deferred.makeUnsafe<ReadonlyArray<ServerProvider>>();
++          freshUsageInFlight.set(instance, completion);
++          // The claim includes time spent waiting for an older probe. Callers
++          // share its successor, never the older probe's cached observation.
++          yield* restore(
++            freshUsageSemaphore.withPermits(1)(
++              refreshOneSource(buildSnapshotSource(instance), instance.invalidateCaches),
++            ),
++          ).pipe(
++            Effect.onExit((exit) =>
++              Effect.sync(() => freshUsageInFlight.delete(instance)).pipe(
++                Effect.andThen(Deferred.done(completion, exit)),
++              ),
++            ),
++            // A caller leaving must not cancel work shared by other callers.
++            Effect.forkIn(serviceScope),
++          );
++          return completion;
++        }),
++      );
++      return yield* Deferred.await(completion);
++    });
++
 +    const refreshUsageSnapshot = Effect.fn("refreshUsageSnapshot")(function* (
 +      instanceId?: ProviderInstanceId,
 +    ) {
@@ -1004,10 +1523,8 @@ index 97da44aa..338b09f5 100644
 +      yield* Effect.forEach(
 +        instances,
 +        (instance) =>
-+          refreshOneSource(buildSnapshotSource(instance), instance.invalidateCaches).pipe(
-+            Effect.catchCause(recoverRefreshFailure),
-+          ),
-+        { concurrency: "unbounded", discard: true },
++          refreshFreshUsageInstance(instance).pipe(Effect.catchCause(recoverRefreshFailure)),
++        { concurrency: 1, discard: true },
 +      );
 +      return yield* Ref.get(providersRef);
 +    });
@@ -1015,7 +1532,7 @@ index 97da44aa..338b09f5 100644
      const refreshAfterUpdate = Effect.fn("refreshAfterUpdate")(function* (
        provider: ProviderDriverKind,
        selectedInstanceId: ProviderInstanceId,
-@@ -958,9 +996,7 @@ export const layer = Layer.effect(
+@@ -958,9 +1026,7 @@ export const layer = Layer.effect(
        });
        if (!claimed) return yield* Ref.get(providersRef);
        const refreshMachineSnapshot = input.fresh
@@ -1026,7 +1543,7 @@ index 97da44aa..338b09f5 100644
          : Effect.void;
        return yield* refreshMachineSnapshot.pipe(
          Effect.andThen(instance.snapshotForCwd(input.cwd)),
-@@ -1014,6 +1050,8 @@ export const layer = Layer.effect(
+@@ -1014,6 +1080,8 @@ export const layer = Layer.effect(
          refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
        refreshInstance: (instanceId: ProviderInstanceId) =>
          refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
@@ -1510,10 +2027,10 @@ index d7a11234..1cab0060 100644
    WsOrchestrationV2StopWorkflowRpc,
 diff --git a/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.ts b/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.ts
 new file mode 100644
-index 00000000..a3000fe3
+index 00000000..94713dd8
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.ts
-@@ -0,0 +1,1167 @@
+@@ -0,0 +1,1232 @@
 +/**
 + * Claude quota autopilot for users with several Claude subscriptions.
 + *
@@ -1594,6 +2111,7 @@ index 00000000..a3000fe3
 +const RUN_SETTLE_MS = 2_000;
 +const PROBE_EVERY_MS = 300_000;
 +const ACTIVE_PROBE_EVERY_MS = 60_000;
++const MAX_PROBE_RETRY_MS = 15 * 60_000;
 +const FRESH_MS = 15 * 60_000;
 +const ACTIVATION_RETRY_MS = 30 * 60_000;
 +// Reported reset times agree to within a second; the margin keeps a "hi" out of the old window.
@@ -1656,15 +2174,22 @@ index 00000000..a3000fe3
 +
 +const isFresh = (account: AccountQuota, nowMs: number) => nowMs - account.checkedAtMs <= FRESH_MS;
 +
++const probeRetryInterval = (active: boolean, failures: number) =>
++  Math.min(
++    MAX_PROBE_RETRY_MS,
++    (active ? ACTIVE_PROBE_EVERY_MS : PROBE_EVERY_MS) * 2 ** Math.min(4, Math.max(0, failures)),
++  );
++
 +/** Sparse streamed updates can advance checkedAt while leaving another window unchanged. */
 +export function isUsageProbeDue(
 +  provider: ServerProvider,
 +  nowMs: number,
 +  lastProbeMs: number | undefined,
 +  active: boolean,
++  consecutiveFailures = 0,
 +): boolean {
 +  if (provider.driver !== CLAUDE_DRIVER || !provider.enabled) return false;
-+  const interval = active ? ACTIVE_PROBE_EVERY_MS : PROBE_EVERY_MS;
++  const interval = probeRetryInterval(active, consecutiveFailures);
 +  if (lastProbeMs !== undefined && nowMs - lastProbeMs < interval) return false;
 +  const checkedAtMs = provider.usageLimits ? Date.parse(provider.usageLimits.checkedAt) : NaN;
 +  return active || !Number.isFinite(checkedAtMs) || nowMs - checkedAtMs >= interval;
@@ -2181,6 +2706,7 @@ index 00000000..a3000fe3
 +  // Set from the event stream, so a run the limit stops is handled within seconds.
 +  let earlySweepAtMs: number | null = null;
 +  const lastProbeMs = new Map<string, number>();
++  const probeFailures = new Map<string, number>();
 +  const fullSinceMs = new Map<string, number>();
 +  const lastActivationMs = new Map<string, number>();
 +  // Only a delivered "hi" can be confirmed; a failed one must not claim the user's own usage.
@@ -2277,6 +2803,22 @@ index 00000000..a3000fe3
 +    activeAccounts: ReadonlySet<string>,
 +  ) {
 +    const providers = yield* registry.getProviders;
++    for (const provider of providers) {
++      if (!probeFailures.has(provider.instanceId)) continue;
++      const checkedAt = provider.usageLimits ? Date.parse(provider.usageLimits.checkedAt) : NaN;
++      if (
++        provider.status === "ready" &&
++        provider.usageLimits?.unavailable === undefined &&
++        checkedAt > (lastProbeMs.get(provider.instanceId) ?? -Infinity)
++      ) {
++        probeFailures.delete(provider.instanceId);
++        lastProbeMs.set(provider.instanceId, checkedAt);
++        yield* log("usage_probe_recovered", {
++          account: provider.instanceId,
++          checkedAt: isoOrNull(checkedAt),
++        });
++      }
++    }
 +    const pool: ReadonlyArray<string> =
 +      settings.accounts.length > 0
 +        ? settings.accounts
@@ -2284,22 +2826,62 @@ index 00000000..a3000fe3
 +            .filter((provider) => provider.driver === CLAUDE_DRIVER)
 +            .map((provider) => provider.instanceId);
 +    yield* Effect.forEach(
-+      providers.filter(
-+        (provider) =>
-+          pool.includes(provider.instanceId) &&
-+          isUsageProbeDue(
-+            provider,
-+            nowMs,
-+            lastProbeMs.get(provider.instanceId),
-+            activeAccounts.has(provider.instanceId),
-+          ),
-+      ),
++      providers
++        .filter(
++          (provider) =>
++            pool.includes(provider.instanceId) &&
++            isUsageProbeDue(
++              provider,
++              nowMs,
++              lastProbeMs.get(provider.instanceId),
++              activeAccounts.has(provider.instanceId),
++              probeFailures.get(provider.instanceId),
++            ),
++        )
++        .toSorted(
++          (a, b) =>
++            Number(activeAccounts.has(b.instanceId)) - Number(activeAccounts.has(a.instanceId)),
++        ),
 +      (provider) =>
 +        Effect.gen(function* () {
-+          lastProbeMs.set(provider.instanceId, nowMs);
-+          yield* registry.refreshUsageSnapshot(provider.instanceId);
++          const before = provider.usageLimits
++            ? Date.parse(provider.usageLimits.checkedAt)
++            : -Infinity;
++          const refreshed = (yield* registry.refreshUsageSnapshot(provider.instanceId)).find(
++            (candidate) => candidate.instanceId === provider.instanceId,
++          );
++          const completedAt = DateTime.toEpochMillis(yield* DateTime.now);
++          lastProbeMs.set(provider.instanceId, completedAt);
++          const previousFailures = probeFailures.get(provider.instanceId) ?? 0;
++          const checkedAt = refreshed?.usageLimits
++            ? Date.parse(refreshed.usageLimits.checkedAt)
++            : NaN;
++          if (
++            refreshed?.status === "ready" &&
++            refreshed.usageLimits?.unavailable === undefined &&
++            Number.isFinite(checkedAt) &&
++            checkedAt > before
++          ) {
++            probeFailures.delete(provider.instanceId);
++            if (previousFailures > 0)
++              yield* log("usage_probe_recovered", {
++                account: provider.instanceId,
++                checkedAt: isoOrNull(checkedAt),
++              });
++          } else {
++            const failures = previousFailures + 1;
++            probeFailures.set(provider.instanceId, failures);
++            yield* log("usage_probe_deferred", {
++              account: provider.instanceId,
++              failures,
++              lastCheckedAt: isoOrNull(Number.isFinite(checkedAt) ? checkedAt : null),
++              retryAt: isoOrNull(
++                completedAt + probeRetryInterval(activeAccounts.has(provider.instanceId), failures),
++              ),
++            });
++          }
 +        }),
-+      { concurrency: 2, discard: true },
++      { concurrency: 1, discard: true },
 +    );
 +    return (yield* registry.getProviders).filter(
 +      (provider) => provider.driver === CLAUDE_DRIVER && pool.includes(provider.instanceId),
@@ -2358,7 +2940,7 @@ index 00000000..a3000fe3
 +    earlySweepAtMs = null;
 +    const settings = yield* readConfig;
 +    if (lastHeartbeatMs === 0)
-+      yield* log("started", { config: configPath, revision: "quota-refresh-reset-1" });
++      yield* log("started", { config: configPath, revision: "quota-probe-pressure-2" });
 +    if (!settings?.enabled) {
 +      if (nowMs - lastHeartbeatMs >= HEARTBEAT_MS) {
 +        lastHeartbeatMs = nowMs;
@@ -2683,10 +3265,10 @@ index 00000000..a3000fe3
 +);
 diff --git a/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts b/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts
 new file mode 100644
-index 00000000..b00a7fe2
+index 00000000..16b795b8
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts
-@@ -0,0 +1,866 @@
+@@ -0,0 +1,879 @@
 +import {
 +  ProviderDriverKind,
 +  ProviderInstanceId,
@@ -2868,6 +3450,19 @@ index 00000000..b00a7fe2
 +        true,
 +      ),
 +    ).toBe(false);
++  });
++
++  it("backs off failed probes while leaving manual refresh outside the automatic gate", () => {
++    const missing = provider({ usageLimits: undefined });
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 60_000, true, 1)).toBe(false);
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 120_000, true, 1)).toBe(true);
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 239_999, true, 2)).toBe(false);
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 240_000, true, 2)).toBe(true);
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 899_999, true, 20)).toBe(false);
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 900_000, true, 20)).toBe(true);
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 60_000, true, 0)).toBe(true);
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 300_000, false, 1)).toBe(false);
++    expect(isUsageProbeDue(missing, nowMs, nowMs - 600_000, false, 1)).toBe(true);
 +  });
 +});
 +

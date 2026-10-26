@@ -1,5 +1,17 @@
 # Changes
 
+## 2026-10-26 — quota-probe-pressure-2
+
+- Serialize Claude capability/usage probe startups across accounts. Time spent waiting for the shared
+  slot does not consume the initialization timeout; model turns use their existing path.
+- Coalesce simultaneous fresh requests per account into one read, including a single fresh successor
+  after an older cached refresh. Cancelling one waiter does not cancel work shared by others.
+- Give active accounts priority, and back off failed automatic probes up to fifteen minutes. Manual
+  refresh bypasses the backoff. Recovery restores the normal cadence.
+- Preserve the last successful quota and its original timestamp through initialization or usage
+  failures. Authentication failures and unsupported accounts keep their distinct meanings.
+- Log `usage_probe_deferred` with the next retry time and `usage_probe_recovered` on recovery.
+
 ## 2026-10-25 — quota-refresh-reset-1
 
 - Manual Limits refresh now bypasses T3's five-minute usage cache on web and mobile, including

@@ -23,6 +23,10 @@ The autopilot wakes the moment a run fails or a quota-timer thread gets its repl
 when an account's known 5-hour window ends, and once a minute otherwise. Usage is read with T3's own
 probe about once a minute for active accounts and every five minutes for idle ones, without sending a
 model message. Manual Limits refresh bypasses T3's usage cache. Upstream reporting may still lag.
+Claude probes start one at a time, and concurrent fresh requests for the same account share one read.
+Failed automatic probes back off up to fifteen minutes; manual refresh bypasses that backoff.
+Running accounts are checked before idle ones. A failed check retains the last successful quota and
+its original timestamp; it does not turn an old percentage into a fresh observation.
 
 **Switching** (an account is "low" when its 5-hour or weekly quota left is ≤ `switchAtRemainingPercent`):
 
@@ -129,6 +133,7 @@ tail, `-Follow` keeps watching. Every action carries a plain `message`, for exam
 identifiers, but not message bodies. Review local logs before sharing them.
 
 Events: `account`, `switched`, `continued`, `waiting_for_reset`, `queue_moved`, `no_target`, `held_background`, `continue_gave_up`,
+`usage_probe_deferred`, `usage_probe_recovered`,
 `activation_sent`, `activation_confirmed`, `would_*` (observe only), `*_failed`.
 
 ## Updating T3

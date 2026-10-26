@@ -82,7 +82,7 @@ if (!$SkipBuild) {
             Set-Content -LiteralPath $lockMark -Value $lockHash
         }
         Step 'Testing'
-        Native 'tests' { & $vp test run apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts apps/server/src/orchestration-v2/runtimeLayer.test.ts apps/server/src/provider/claudeUsageLimits.test.ts apps/server/src/provider/ProviderRegistry.test.ts apps/server/src/ws.test.ts packages/client-runtime/src/state/usage.test.ts apps/mobile/src/features/usage/UsageLimitsSection.test.ts *> (Join-Path $work 'tests.log') }
+        Native 'tests' { & $vp test run apps/server/src/orchestration-v2/ClaudeQuotaAutopilot.test.ts apps/server/src/orchestration-v2/runtimeLayer.test.ts apps/server/src/provider/claudeUsageLimits.test.ts apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts apps/server/src/provider/ProviderRegistry.test.ts apps/server/src/ws.test.ts packages/provider-core/src/server/managedProvider.test.ts packages/client-runtime/src/state/usage.test.ts apps/mobile/src/features/usage/UsageLimitsSection.test.ts --maxWorkers=1 *> (Join-Path $work 'tests.log') }
         Step 'Building'
         $releaseFiles = 'apps/server/package.json', 'apps/desktop/package.json', 'apps/web/package.json', 'packages/contracts/package.json'
         # Official CI bakes public config (T3 Connect sign-in, relay, telemetry channel) into the
